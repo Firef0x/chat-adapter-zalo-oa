@@ -2,7 +2,7 @@
 
 [Chat SDK](https://chat-sdk.dev) adapter for the [Zalo Official Account (OA) API](https://docs.zaloplatforms.com/docs/OA).
 
-This release covers **one-to-one conversations** between an Official Account and a user: receiving their messages, replying, quoting, and reading history. Group chats (GMF), sending media, reactions and template messages are planned.
+This release covers **one-to-one conversations** between an Official Account and a user: text, images, GIFs, files, stickers and reactions in both directions, quoted replies, and history. Group chats (GMF) and template messages are planned.
 
 > This targets the Official Account API at `openapi.zalo.me`. It is a different product from the Zalo Bot Platform, which [`chat-adapter-zalo`](https://www.npmjs.com/package/chat-adapter-zalo) covers.
 
@@ -18,16 +18,16 @@ npm install chat-adapter-zalo-oa chat
 import { Chat } from "chat";
 import { createZaloOaAdapter } from "chat-adapter-zalo-oa";
 
+const zaloOa = createZaloOaAdapter({
+  onTokenRefresh: async (tokens) => {
+    // Required in practice: the refresh token is single-use.
+    await saveZaloTokens(tokens);
+  },
+});
+
 const bot = new Chat({
   userName: "acme",
-  adapters: {
-    zaloOa: createZaloOaAdapter({
-      onTokenRefresh: async (tokens) => {
-        // Required in practice: the refresh token is single-use.
-        await saveZaloTokens(tokens);
-      },
-    }),
-  },
+  adapters: { zaloOa },
   state,
 });
 
@@ -90,7 +90,7 @@ Zalo also expects an answer **within two seconds**, so the adapter does not wait
 
 The default tolerance of two hours is deliberate. Zalo retries a failed delivery after 30 s, 5 min, 15 min, 30 min and 1 h, each time with the original timestamp. A shorter window would discard exactly the retries meant to recover an outage. Redeliveries are deduplicated by message ID.
 
-The adapter dispatches `user_send_*` events. It ignores the OA's own `oa_send_*` echoes, so the bot never answers itself or a colleague using the OA chat tool. Group events and other event types are ignored in this release.
+The adapter dispatches `user_send_*` events as messages and `user_reacted_message` as reactions. It ignores the OA's own `oa_send_*` and `oa_reacted_message` echoes, so the bot never answers itself or a colleague using the OA chat tool. Group events and other event types are ignored in this release.
 
 ## Messaging rules
 
@@ -100,6 +100,62 @@ Zalo enforces these, not the adapter:
 - Consultation messages are free within **48 hours** of the user's last interaction and charged after that.
 - Text is limited to **2,000 characters**. Longer messages are refused before a request is made.
 
+## Sending media
+
+A message can carry **one** attachment through Chat SDK's `files`:
+
+```ts
+await thread.post({
+  markdown: "New arrivals",
+  files: [{ data: imageBuffer, filename: "arrivals.png" }],
+});
+```
+
+| Kind | Formats | Max size | Text |
+| --- | --- | --- | --- |
+| Image | JPG, PNG | 1 MB | Sent as the caption |
+| GIF | GIF | 5 MB | Sent as the caption |
+| File | PDF, DOC, DOCX, CSV | 5 MB | Not allowed |
+
+Images and GIFs are recognized by their bytes, not their name, so a WebP named `photo.png` is refused locally instead of by Zalo. A GIF's width and height, which Zalo requires, are read from its header. Every limit is checked before uploading, because uploads spend from a quota of 5,000 a month. Zalo writes "1MB" and "5MB" without saying which megabyte, so the limits use the stricter decimal reading.
+
+Several attachments, or text together with a file, are refused rather than split into several messages. Send them separately so you decide the order and get back every message ID. Quoted replies carry text only. Zalo keeps uploaded media for seven days.
+
+## Stickers
+
+Chat SDK has no sticker concept, so stickers have their own method on the adapter:
+
+```ts
+import { getStickerId } from "chat-adapter-zalo-oa";
+
+bot.onDirectMessage(async (thread, message) => {
+  const stickerId = getStickerId(message.raw);
+  if (stickerId) {
+    await zaloOa.sendSticker(thread.id, stickerId);
+  }
+});
+```
+
+Zalo has no API that lists stickers. IDs come from [stickers.zaloapp.com](https://stickers.zaloapp.com) or from a sticker a user sent. An inbound sticker also arrives as an image attachment.
+
+## Reactions
+
+Zalo offers a fixed set of reactions:
+
+| Chat SDK emoji | Zalo code |
+| --- | --- |
+| `thumbs_up` 👍 | `/-strong` |
+| `heart` ❤️ | `/-heart` |
+| `laugh` 😆 | `:>` |
+| `surprised` 😮 | `:o` |
+| `cry` 😭 | `:-((` |
+| `angry` 😠 | `:-h` |
+| none | `--b` |
+
+`addReaction` accepts an emoji value, its name, its Unicode form, or the Zalo code. `--b` has no documented meaning, so it is sent and received only by its code. Any other emoji is refused with the list above.
+
+Zalo's withdrawal names no emoji. `removeReaction` therefore removes whatever reaction the OA placed on the message, not only the one you pass. When a user withdraws a reaction, the event arrives with `added: false` and `rawEmoji: "/-remove"`, so you learn that they withdrew one, not which.
+
 ## Features
 
 | Feature | Support |
@@ -107,6 +163,9 @@ Zalo enforces these, not the adapter:
 | Receive text, image, GIF, sticker, video, audio, file | Yes. Media arrives as attachments with `fetchData()`. |
 | Receive link and location | As text |
 | Send text | Yes |
+| Send image, GIF, file | Yes, one per message |
+| Send and receive stickers | `sendSticker()`, `getStickerId()` |
+| Send and receive reactions | Yes, Zalo's fixed set |
 | Reply with a quote | Yes, via `reply()` |
 | Cards | Flattened to text, buttons listed as options |
 | Message history | Yes. Backward only, 10 per request, offset cursor. |
@@ -114,7 +173,7 @@ Zalo enforces these, not the adapter:
 | OA profile, user profile | `fetchChannelInfo()`, `getUser()` |
 | Typing indicator | No-op. Zalo has no such API. |
 | Edit, delete | Not supported by Zalo |
-| Send media, reactions, group chats, template messages | Not yet |
+| Group chats, template messages | Not yet |
 
 ## Errors
 

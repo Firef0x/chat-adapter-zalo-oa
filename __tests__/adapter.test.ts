@@ -1,9 +1,10 @@
 import { NetworkError, ValidationError } from "@chat-adapter/shared";
 import type { Message } from "chat";
-import { NotImplementedError } from "chat";
+import { emoji, NotImplementedError } from "chat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ZaloOaAdapter } from "../src/adapter.js";
+import { getStickerId } from "../src/lib/media.js";
 import { signWebhookBody } from "../src/lib/webhook.js";
 import type { ZaloOaHistoryMessage, ZaloOaRawMessage, ZaloOaWebhookEvent } from "../src/types.js";
 import { ZALO_OA_ERROR } from "../src/types.js";
@@ -74,6 +75,34 @@ function build(fetchImpl: ReturnType<typeof vi.fn> = vi.fn(async () => ok({}))) 
   return { adapter, fetchImpl };
 }
 
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+/** A GIF89a header declaring 320 x 240. */
+const GIF = Buffer.concat([
+  Buffer.from("GIF89a", "latin1"),
+  Buffer.from([0x40, 0x01, 0xf0, 0x00]),
+  Buffer.from([0, 0, 0]),
+]);
+const PDF = Buffer.from("%PDF-1.7 hello", "latin1");
+
+/**
+ * A fetch stand-in that answers uploads with an ID and sends with a message.
+ * Records each request's URL and body for assertions.
+ */
+function mediaFetch(upload: Record<string, unknown> = { attachment_id: "att_1" }) {
+  return vi.fn(async (url: string) => {
+    if (url.includes("/upload/")) {
+      return ok(upload);
+    }
+    return ok({ message_id: "sent_1", user_id: USER_ID, sent_time: String(T0) });
+  });
+}
+
+function sentBody(fetchImpl: ReturnType<typeof vi.fn>) {
+  const call = fetchImpl.mock.calls.find((c) => String(c[0]).endsWith("/v3.0/oa/message/cs"));
+  const init = call?.[1] as RequestInit | undefined;
+  return JSON.parse(init?.body as string);
+}
+
 /** Minimal ChatInstance stand-in that records dispatched messages. */
 function attachChat() {
   const processed: Array<{
@@ -95,6 +124,7 @@ function attachChat() {
         return Promise.resolve();
       },
     ),
+    processReaction: vi.fn(),
   };
   return { chat, processed, logger };
 }
@@ -308,6 +338,23 @@ describe("ZaloOaAdapter", () => {
         ),
       );
       expect(processed[0]?.message.attachments[0]).toMatchObject({ type: kind, mimeType });
+    });
+
+    it("does not mistake an inherited name for an attachment type", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(
+        webhookRequest(
+          userEvent({
+            event_name: "user_send_file",
+            message: {
+              msg_id: "proto",
+              text: "x",
+              attachments: [{ type: "constructor", payload: { url: "https://x/y" } }],
+            },
+          }),
+        ),
+      );
+      expect(processed[0]?.message.attachments).toEqual([]);
     });
 
     it("keeps a file's name and size", async () => {
@@ -566,16 +613,6 @@ describe("ZaloOaAdapter", () => {
       );
     });
 
-    it("refuses attachments until media sending is supported", async () => {
-      await expect(
-        adapter.postMessage(THREAD_ID, {
-          raw: "",
-          files: [{ data: Buffer.from([1]), filename: "a.png", mimeType: "image/png" }],
-        }),
-      ).rejects.toBeInstanceOf(NotImplementedError);
-      expect(fetchImpl).not.toHaveBeenCalled();
-    });
-
     it("refuses a group thread", async () => {
       await expect(adapter.postMessage(`zalo-oa:${OA_ID}:group:abc`, "hi")).rejects.toBeInstanceOf(
         NotImplementedError,
@@ -712,6 +749,12 @@ describe("ZaloOaAdapter", () => {
       await expect(
         adapter.fetchMessages(THREAD_ID, { direction: "forward" }),
       ).rejects.toBeInstanceOf(NotImplementedError);
+    });
+
+    it("does not mistake an inherited name for a history attachment type", () => {
+      const { adapter } = build();
+      const message = adapter.parseMessage(history({ type: "constructor", url: "https://x/y" }));
+      expect(message.attachments).toEqual([]);
     });
 
     it("exposes photos and voice notes as attachments", async () => {
@@ -932,10 +975,416 @@ describe("ZaloOaAdapter", () => {
     });
   });
 
+  describe("sending media", () => {
+    it("uploads an image and sends it with its caption", async () => {
+      const fetchImpl = mediaFetch();
+      const { adapter } = build(fetchImpl);
+
+      const result = await adapter.postMessage(THREAD_ID, {
+        markdown: "**New** arrivals",
+        files: [{ data: PNG, filename: "a.png", mimeType: "image/png" }],
+      });
+
+      expect(result.id).toBe("sent_1");
+      const [uploadUrl, uploadInit] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+      expect(uploadUrl).toBe("https://openapi.zalo.me/v2.0/oa/upload/image");
+      const form = uploadInit.body as FormData;
+      const file = form.get("file") as File;
+      expect(file.name).toBe("a.png");
+      expect(file.type).toBe("image/png");
+      expect(Buffer.from(await file.arrayBuffer())).toEqual(PNG);
+      // The runtime must set the multipart boundary itself.
+      expect(uploadInit.headers).toEqual({ access_token: "acc_1" });
+
+      expect(sentBody(fetchImpl)).toEqual({
+        recipient: { user_id: USER_ID },
+        message: {
+          text: "New arrivals",
+          attachment: {
+            type: "template",
+            payload: {
+              template_type: "media",
+              elements: [{ media_type: "image", attachment_id: "att_1" }],
+            },
+          },
+        },
+      });
+    });
+
+    it("sends an image without a caption when there is no text", async () => {
+      const fetchImpl = mediaFetch();
+      const { adapter } = build(fetchImpl);
+      await adapter.postMessage(THREAD_ID, { raw: "", files: [{ data: PNG, filename: "a.png" }] });
+      expect(sentBody(fetchImpl).message).not.toHaveProperty("text");
+    });
+
+    it("sends a GIF with the dimensions read from its header", async () => {
+      const fetchImpl = mediaFetch({ token: "gif_1" });
+      const { adapter } = build(fetchImpl);
+      await adapter.postMessage(THREAD_ID, { raw: "", files: [{ data: GIF, filename: "a.gif" }] });
+
+      expect(fetchImpl.mock.calls[0]?.[0]).toBe("https://openapi.zalo.me/v2.0/oa/upload/gif");
+      expect(sentBody(fetchImpl).message.attachment.payload.elements).toEqual([
+        { media_type: "gif", attachment_id: "gif_1", width: 320, height: 240 },
+      ]);
+    });
+
+    it("uploads a document and sends it by token", async () => {
+      const fetchImpl = mediaFetch({ token: "file_tok" });
+      const { adapter } = build(fetchImpl);
+      await adapter.postMessage(THREAD_ID, { raw: "", files: [{ data: PDF, filename: "q3.pdf" }] });
+
+      expect(fetchImpl.mock.calls[0]?.[0]).toBe("https://openapi.zalo.me/v2.0/oa/upload/file");
+      expect(sentBody(fetchImpl)).toEqual({
+        recipient: { user_id: USER_ID },
+        message: { attachment: { type: "file", payload: { token: "file_tok" } } },
+      });
+    });
+
+    it("refuses text with a file before uploading", async () => {
+      const fetchImpl = mediaFetch();
+      const { adapter } = build(fetchImpl);
+      await expect(
+        adapter.postMessage(THREAD_ID, {
+          markdown: "Your report",
+          files: [{ data: PDF, filename: "q3.pdf" }],
+        }),
+      ).rejects.toThrow(/cannot attach text to a file/);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("refuses several attachments before uploading", async () => {
+      const fetchImpl = mediaFetch();
+      const { adapter } = build(fetchImpl);
+      await expect(
+        adapter.postMessage(THREAD_ID, {
+          raw: "",
+          files: [
+            { data: PNG, filename: "a.png" },
+            { data: PNG, filename: "b.png" },
+          ],
+        }),
+      ).rejects.toThrow(/one attachment per message; got 2/);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("refuses an unsupported type before uploading", async () => {
+      const fetchImpl = mediaFetch();
+      const { adapter } = build(fetchImpl);
+      await expect(
+        adapter.postMessage(THREAD_ID, {
+          raw: "",
+          files: [{ data: Buffer.from("RIFF0000WEBP"), filename: "a.webp" }],
+        }),
+      ).rejects.toBeInstanceOf(ValidationError);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("refuses an over-long caption before uploading", async () => {
+      const fetchImpl = mediaFetch();
+      const { adapter } = build(fetchImpl);
+      await expect(
+        adapter.postMessage(THREAD_ID, {
+          raw: "a".repeat(2001),
+          files: [{ data: PNG, filename: "a.png" }],
+        }),
+      ).rejects.toThrow(/caption is 2001/);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("accepts a Blob or an ArrayBuffer as the file data", async () => {
+      const fetchImpl = mediaFetch();
+      const { adapter } = build(fetchImpl);
+      await adapter.postMessage(THREAD_ID, {
+        raw: "",
+        files: [{ data: new Blob([new Uint8Array(PNG)]), filename: "a.png" }],
+      });
+      const ab = PNG.buffer.slice(PNG.byteOffset, PNG.byteOffset + PNG.byteLength);
+      await adapter.postMessage(THREAD_ID, {
+        raw: "",
+        files: [{ data: ab as ArrayBuffer, filename: "b.png" }],
+      });
+      expect(fetchImpl.mock.calls.filter((c) => String(c[0]).includes("/upload/"))).toHaveLength(2);
+    });
+
+    it("refuses a file in a quoted reply", async () => {
+      const fetchImpl = mediaFetch();
+      const { adapter } = build(fetchImpl);
+      await expect(
+        adapter.reply(THREAD_ID, "m1", { raw: "", files: [{ data: PNG, filename: "a.png" }] }),
+      ).rejects.toThrow(/quotes only text/);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("sends a sticker by ID", async () => {
+      const fetchImpl = mediaFetch();
+      const { adapter } = build(fetchImpl);
+      const result = await adapter.sendSticker(THREAD_ID, "bfe458bf64fa8da4d4eb");
+
+      expect(result.id).toBe("sent_1");
+      expect(sentBody(fetchImpl)).toEqual({
+        recipient: { user_id: USER_ID },
+        message: {
+          attachment: {
+            type: "template",
+            payload: {
+              template_type: "media",
+              elements: [{ media_type: "sticker", attachment_id: "bfe458bf64fa8da4d4eb" }],
+            },
+          },
+        },
+      });
+    });
+
+    it("refuses an empty sticker ID", async () => {
+      const { adapter, fetchImpl } = build();
+      await expect(adapter.sendSticker(THREAD_ID, "  ")).rejects.toBeInstanceOf(ValidationError);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("refuses a sticker for a group thread", async () => {
+      const { adapter } = build();
+      await expect(adapter.sendSticker(`zalo-oa:${OA_ID}:group:abc`, "s")).rejects.toBeInstanceOf(
+        NotImplementedError,
+      );
+    });
+  });
+
+  describe("reactions", () => {
+    it.each([
+      ["a well-known emoji", emoji.heart, "/-heart"],
+      ["a well-known name", "thumbs_up", "/-strong"],
+      ["a Zalo icon code", "--b", "--b"],
+    ])("reacts with %s", async (_label, value, icon) => {
+      const { adapter, fetchImpl } = build();
+      await adapter.addReaction(THREAD_ID, "789f573aecf8a9a4f0eb", value);
+
+      const { url, body } = lastCall(fetchImpl);
+      expect(url.href).toBe("https://openapi.zalo.me/v2.0/oa/message");
+      expect(body).toEqual({
+        recipient: { user_id: USER_ID },
+        sender_action: { react_icon: icon, react_message_id: "789f573aecf8a9a4f0eb" },
+      });
+    });
+
+    it("reacts with a Unicode emoji", async () => {
+      const { adapter, fetchImpl } = build();
+      await adapter.addReaction(THREAD_ID, "m1", "👍");
+      expect(lastCall(fetchImpl).body.sender_action.react_icon).toBe("/-strong");
+    });
+
+    it("refuses an inherited property name as a reaction", async () => {
+      const { adapter, fetchImpl } = build();
+      await expect(adapter.addReaction(THREAD_ID, "m1", "toString")).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("refuses an emoji Zalo does not offer, naming the ones it does", async () => {
+      const { adapter, fetchImpl } = build();
+      const failure = adapter.addReaction(THREAD_ID, "m", emoji.rocket);
+      await expect(failure).rejects.toBeInstanceOf(ValidationError);
+      await expect(failure).rejects.toThrow(/no "rocket" reaction.*heart \(\/-heart\)/);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("withdraws with /-remove", async () => {
+      const { adapter, fetchImpl } = build();
+      await adapter.removeReaction(THREAD_ID, "m1", emoji.heart);
+      expect(lastCall(fetchImpl).body.sender_action).toEqual({
+        react_icon: "/-remove",
+        react_message_id: "m1",
+      });
+    });
+
+    it("checks the emoji even when withdrawing", async () => {
+      const { adapter, fetchImpl } = build();
+      await expect(adapter.removeReaction(THREAD_ID, "m1", "hart")).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("refuses a reaction without a message ID", async () => {
+      const { adapter, fetchImpl } = build();
+      await expect(adapter.addReaction(THREAD_ID, "", "heart")).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    function reactionEvent(icon: string, overrides: Partial<ZaloOaWebhookEvent> = {}) {
+      return userEvent({
+        event_name: "user_reacted_message",
+        message: { msg_id: "789f573aecf8a9a4f0eb", react_icon: icon },
+        ...overrides,
+      });
+    }
+
+    it("delivers a user's reaction as a reaction event", async () => {
+      const { adapter, chat } = await initialized();
+      const options = { waitUntil: vi.fn() };
+      const event = reactionEvent("/-heart");
+      const response = await adapter.handleWebhook(webhookRequest(event), options);
+
+      expect(response.status).toBe(200);
+      expect(chat.processReaction).toHaveBeenCalledTimes(1);
+      const [delivered, passed] = chat.processReaction.mock.calls[0] as [
+        Record<string, unknown>,
+        unknown,
+      ];
+      expect(passed).toBe(options);
+      expect(delivered).toMatchObject({
+        adapter,
+        added: true,
+        rawEmoji: "/-heart",
+        messageId: "789f573aecf8a9a4f0eb",
+        threadId: THREAD_ID,
+        user: { userId: USER_ID, isMe: false, isBot: false },
+        raw: event,
+      });
+      expect((delivered.emoji as { name: string }).name).toBe("heart");
+    });
+
+    it("delivers --b as a custom emoji under its own code", async () => {
+      const { adapter, chat } = await initialized();
+      await adapter.handleWebhook(webhookRequest(reactionEvent("--b")));
+      const [delivered] = chat.processReaction.mock.calls[0] as [Record<string, unknown>];
+      expect((delivered.emoji as { name: string }).name).toBe("--b");
+    });
+
+    it("delivers a withdrawal as added: false", async () => {
+      const { adapter, chat } = await initialized();
+      await adapter.handleWebhook(webhookRequest(reactionEvent("/-remove")));
+      expect(chat.processReaction.mock.calls[0]?.[0]).toMatchObject({
+        added: false,
+        rawEmoji: "/-remove",
+      });
+    });
+
+    it("delivers a redelivered reaction once, but a repeat reaction again", async () => {
+      const { adapter, chat } = await initialized();
+      const first = reactionEvent("/-heart", { timestamp: String(Date.now() - 2000) });
+      await adapter.handleWebhook(webhookRequest(first));
+      await adapter.handleWebhook(webhookRequest(first));
+      await adapter.handleWebhook(
+        webhookRequest(reactionEvent("/-heart", { timestamp: String(Date.now()) })),
+      );
+      expect(chat.processReaction).toHaveBeenCalledTimes(2);
+    });
+
+    it("ignores the OA's own reaction echo", async () => {
+      const { adapter, chat, processed, logger } = await initialized();
+      await adapter.handleWebhook(
+        webhookRequest(
+          reactionEvent("/-heart", {
+            event_name: "oa_reacted_message",
+            sender: { id: OA_ID },
+            recipient: { id: USER_ID },
+          }),
+        ),
+      );
+      expect(chat.processReaction).not.toHaveBeenCalled();
+      expect(processed).toHaveLength(0);
+      expect(logger.debug).toHaveBeenCalledWith("Ignoring a Zalo OA echo", {
+        event: "oa_reacted_message",
+      });
+    });
+
+    it("refuses a reaction addressed to a different OA", async () => {
+      const { adapter, chat, logger } = await initialized();
+      await adapter.handleWebhook(
+        webhookRequest(reactionEvent("/-heart", { recipient: { id: "9" } })),
+      );
+      expect(chat.processReaction).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Ignoring a Zalo OA webhook for a different Official Account",
+        { event: "user_reacted_message" },
+      );
+    });
+
+    it("warns about a reaction with no icon", async () => {
+      const { adapter, chat, logger } = await initialized();
+      await adapter.handleWebhook(webhookRequest(reactionEvent("", { message: { msg_id: "m" } })));
+      expect(chat.processReaction).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Ignoring a Zalo OA reaction with no message, sender or icon",
+        { messageId: "m", userId: USER_ID, icon: "" },
+      );
+    });
+
+    it("logs a reaction that arrives before initialize()", async () => {
+      const logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+      const local = new ZaloOaAdapter({
+        appId: APP_ID,
+        appSecret: "s",
+        oaSecretKey: OA_SECRET,
+        oaId: OA_ID,
+        accessToken: "a",
+        refreshToken: "r",
+        logger: logger as never,
+      });
+      await local.handleWebhook(webhookRequest(reactionEvent("/-heart")));
+      expect(logger.error).toHaveBeenCalledWith(
+        "Zalo OA adapter received a reaction before initialize() was called",
+        { messageId: "789f573aecf8a9a4f0eb" },
+      );
+    });
+  });
+
+  describe("stickers", () => {
+    it("reads the ID of a sticker a user sent", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(
+        webhookRequest(
+          userEvent({
+            event_name: "user_send_sticker",
+            message: {
+              msg_id: "s1",
+              attachments: [
+                { type: "sticker", payload: { id: "e1540df031b5deb81a4", url: "https://x/s" } },
+              ],
+            },
+          }),
+        ),
+      );
+      expect(getStickerId(processed[0]?.message.raw)).toBe("e1540df031b5deb81a4");
+    });
+
+    it.each([null, undefined, "text", 5, {}, { event_name: "x", message: { attachments: "no" } }])(
+      "finds no sticker in the malformed raw value %j",
+      (raw) => {
+        expect(getStickerId(raw)).toBeUndefined();
+      },
+    );
+
+    it("ignores a sticker ID that is not a string", () => {
+      const event = userEvent({
+        event_name: "user_send_sticker",
+        message: { msg_id: "s", attachments: [{ type: "sticker", payload: { id: 7 as never } }] },
+      });
+      expect(getStickerId(event)).toBeUndefined();
+    });
+
+    it("finds no sticker in a text message or a history entry", () => {
+      expect(getStickerId(userEvent())).toBeUndefined();
+      expect(
+        getStickerId({
+          message_id: "h",
+          src: 1,
+          time: T0,
+          type: "sticker",
+          url: "https://x/s",
+          from_id: USER_ID,
+          to_id: OA_ID,
+        }),
+      ).toBeUndefined();
+    });
+  });
+
   describe("unsupported operations", () => {
     it.each([
-      ["addReaction", (a: ZaloOaAdapter) => a.addReaction(THREAD_ID, "m", "heart")],
-      ["removeReaction", (a: ZaloOaAdapter) => a.removeReaction(THREAD_ID, "m", "heart")],
       ["editMessage", (a: ZaloOaAdapter) => a.editMessage(THREAD_ID, "m", "x")],
       ["deleteMessage", (a: ZaloOaAdapter) => a.deleteMessage(THREAD_ID, "m")],
     ])("%s throws NotImplementedError", async (_name, call) => {

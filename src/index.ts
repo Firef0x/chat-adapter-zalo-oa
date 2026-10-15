@@ -11,6 +11,21 @@ export {
 export { cardToPlainText } from "./lib/card-to-text.js";
 export { ZaloOaFormatConverter } from "./lib/format-converter.js";
 export {
+  getStickerId,
+  gifDimensions,
+  MEDIA_LIMITS,
+  type PreparedMedia,
+  prepareMedia,
+  uploadMedia,
+  type ZaloOaMediaKind,
+} from "./lib/media.js";
+export {
+  fromZaloReactIcon,
+  toZaloReactIcon,
+  ZALO_REACTIONS,
+  ZALO_REMOVE_REACTION,
+} from "./lib/reactions.js";
+export {
   channelIdFromThreadId,
   decodeChannelId,
   decodeThreadId,
@@ -37,6 +52,8 @@ export type {
   ZaloOaErrorCode,
   ZaloOaHistoryMessage,
   ZaloOaInfo,
+  ZaloOaMediaElement,
+  ZaloOaOutboundMessage,
   ZaloOaRawMessage,
   ZaloOaSendMessageData,
   ZaloOaThreadId,

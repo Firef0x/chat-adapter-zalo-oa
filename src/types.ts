@@ -183,6 +183,25 @@ export interface ZaloOaSendMessageData {
   };
 }
 
+/** One element of a `media` template: an image, GIF or sticker. */
+export type ZaloOaMediaElement =
+  | { media_type: "image"; attachment_id: string }
+  | { media_type: "gif"; attachment_id: string; width?: number; height?: number }
+  | { media_type: "sticker"; attachment_id: string };
+
+/** The `message` of `POST /v3.0/oa/message/cs`. */
+export interface ZaloOaOutboundMessage {
+  /** Up to 2,000 characters. With a media template, the caption. */
+  text?: string;
+  quote_message_id?: string;
+  attachment?:
+    | {
+        type: "template";
+        payload: { template_type: "media"; elements: [ZaloOaMediaElement] };
+      }
+    | { type: "file"; payload: { token: string } };
+}
+
 /** `data` of `GET /v2.0/oa/getoa`. */
 export interface ZaloOaInfo {
   oa_id?: string | number;
@@ -273,6 +292,8 @@ export interface ZaloOaWebhookAttachment {
 export interface ZaloOaWebhookMessage {
   msg_id?: string;
   text?: string;
+  /** Set on `user_reacted_message`: the icon code, or `/-remove` for a withdrawal. */
+  react_icon?: string;
   /** Present when the user replied to a specific message. */
   quote_msg_id?: string;
   attachments?: ZaloOaWebhookAttachment[];

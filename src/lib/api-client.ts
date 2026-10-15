@@ -49,6 +49,14 @@ export interface ZaloOaRequest {
    */
   query?: Record<string, string | number | undefined>;
   body?: unknown;
+  /**
+   * Multipart payload, for the upload endpoints. Replaces `body`.
+   *
+   * The Content-Type header is left unset so the runtime can add the
+   * multipart boundary; setting it by hand produces a body the server cannot
+   * parse.
+   */
+  formData?: FormData;
 }
 
 /** The account or app is misconfigured; retrying cannot help, and an operator must act. */
@@ -209,8 +217,10 @@ export class ZaloOaApiClient {
     accessToken: string,
   ): Promise<ZaloOaApiEnvelope<TData>> {
     const headers: Record<string, string> = { access_token: accessToken };
-    let body: string | undefined;
-    if (req.method === "POST") {
+    let body: BodyInit | undefined;
+    if (req.formData) {
+      body = req.formData;
+    } else if (req.method === "POST") {
       headers["Content-Type"] = "application/json";
       body = JSON.stringify(req.body ?? {});
     }

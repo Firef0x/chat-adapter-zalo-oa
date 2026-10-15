@@ -9,6 +9,7 @@ import type {
   EmojiValue,
   FetchOptions,
   FetchResult,
+  FileUpload,
   FormattedContent,
   Logger,
   RawMessage,
@@ -21,6 +22,14 @@ import { ConsoleLogger, Message, NotImplementedError } from "chat";
 import { ZaloOaApiClient } from "./lib/api-client.js";
 import { BoundedSet } from "./lib/bounded-set.js";
 import { ZaloOaFormatConverter } from "./lib/format-converter.js";
+import { lookup } from "./lib/lookup.js";
+import { prepareMedia, toBuffer, uploadMedia } from "./lib/media.js";
+import {
+  fromZaloReactIcon,
+  supportedReactions,
+  toZaloReactIcon,
+  ZALO_REMOVE_REACTION,
+} from "./lib/reactions.js";
 import {
   ADAPTER_NAME,
   channelIdFromThreadId,
@@ -34,6 +43,7 @@ import type {
   ZaloOaAdapterConfig,
   ZaloOaHistoryMessage,
   ZaloOaInfo,
+  ZaloOaOutboundMessage,
   ZaloOaRawMessage,
   ZaloOaSendMessageData,
   ZaloOaThreadId,
@@ -314,10 +324,15 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
       return;
     }
 
-    // Echoes of messages the OA sent, through this adapter or an agent typing
-    // in the OA chat tool. Delivering them would make the bot answer itself
-    // or a colleague; the history endpoint still returns them.
-    if (eventName.startsWith("oa_send_")) {
+    if (eventName === "user_reacted_message") {
+      this.dispatchReaction(event, options);
+      return;
+    }
+
+    // Echoes of what the OA did, through this adapter or an agent using the
+    // OA chat tool. Delivering them would make the bot answer itself or a
+    // colleague; the history endpoint still returns the messages.
+    if (eventName.startsWith("oa_send_") || eventName === "oa_reacted_message") {
       this.logger.debug("Ignoring a Zalo OA echo", { event: eventName });
       return;
     }
@@ -373,6 +388,65 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     // to this promise and logs a failing handler, and registers it with
     // `waitUntil` when one is given.
     void this.chat.processMessage(this, this.userThreadId(userId), message, options);
+  }
+
+  /**
+   * Deliver a user's reaction as a reaction event.
+   *
+   * Withdrawing a reaction arrives as the icon `/-remove`, which names no
+   * emoji. It is delivered as `added: false` with that code as the emoji, so
+   * a host learns that the user withdrew a reaction but not which one.
+   */
+  private dispatchReaction(event: ZaloOaWebhookEvent, options?: WebhookOptions): void {
+    if (idOf(event.recipient?.id) !== this.config.oaId) {
+      this.logger.warn("Ignoring a Zalo OA webhook for a different Official Account", {
+        event: event.event_name,
+      });
+      return;
+    }
+
+    const messageId = idOf(event.message?.msg_id);
+    const userId = idOf(event.sender?.id);
+    const icon = typeof event.message?.react_icon === "string" ? event.message.react_icon : "";
+    if (!messageId || !userId || !icon) {
+      this.logger.warn("Ignoring a Zalo OA reaction with no message, sender or icon", {
+        messageId,
+        userId,
+        icon,
+      });
+      return;
+    }
+
+    if (!this.chat) {
+      this.logger.error("Zalo OA adapter received a reaction before initialize() was called", {
+        messageId,
+      });
+      return;
+    }
+
+    // A reaction has no ID of its own. Its content and send time together
+    // identify a delivery, and a redelivery repeats both exactly.
+    const key = `reaction:${messageId}:${userId}:${icon}:${idOf(event.timestamp)}`;
+    if (!this.seenMessages.add(key)) {
+      this.logger.debug("Ignoring duplicate Zalo OA reaction", { messageId });
+      return;
+    }
+
+    this.chat.processReaction(
+      {
+        // Optional in the SDK's type but required at runtime: without it the
+        // event is dropped before any handler runs.
+        adapter: this,
+        added: icon !== ZALO_REMOVE_REACTION,
+        emoji: fromZaloReactIcon(icon),
+        rawEmoji: icon,
+        messageId,
+        threadId: this.userThreadId(userId),
+        user: { userId, userName: userId, fullName: "", isBot: false, isMe: false },
+        raw: event,
+      },
+      options,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -441,7 +515,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
   }
 
   private webhookAttachment(attachment: ZaloOaWebhookAttachment): Attachment[] {
-    const kind = ATTACHMENT_KINDS[attachment.type];
+    const kind = lookup(ATTACHMENT_KINDS, String(attachment.type));
     const url = attachment.payload?.url;
     if (!kind || !url) {
       return [];
@@ -484,7 +558,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     if (!userId) {
       throw new ValidationError(ADAPTER_NAME, "A Zalo OA history entry names no user.");
     }
-    const kind = HISTORY_ATTACHMENT_KINDS[entry.type];
+    const kind = lookup(HISTORY_ATTACHMENT_KINDS, String(entry.type));
     const url = entry.url;
     const text =
       entry.message ||
@@ -630,15 +704,28 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
   // Sending
   // -------------------------------------------------------------------------
 
+  /**
+   * Send a message.
+   *
+   * A message may carry one attachment: a JPG or PNG image or a GIF, with
+   * optional text shown as its caption, or a PDF, DOC, DOCX or CSV file,
+   * which cannot carry text. Several attachments, or text with a file, are
+   * refused rather than split into several messages, so the caller decides
+   * what gets sent and gets back the one message ID it asked for.
+   */
   async postMessage(
     threadId: string,
     message: AdapterPostableMessage,
   ): Promise<RawMessage<ZaloOaRawMessage>> {
     const userId = this.userIdOf(threadId);
-    return this.send(threadId, userId, { text: this.renderSendableText(message) });
+    const files = extractFiles(message);
+    if (files.length === 0) {
+      return this.send(threadId, userId, { text: this.renderSendableText(message) });
+    }
+    return this.sendMedia(threadId, userId, message, files);
   }
 
-  /** Reply to a specific message, which Zalo shows as a quote. */
+  /** Reply to a specific message, which Zalo shows as a quote. Text only. */
   async reply(
     threadId: string,
     messageId: string,
@@ -647,6 +734,12 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     const userId = this.userIdOf(threadId);
     if (!messageId) {
       throw new ValidationError(ADAPTER_NAME, "A message ID is required to quote a message.");
+    }
+    if (extractFiles(message).length > 0) {
+      throw new ValidationError(
+        ADAPTER_NAME,
+        "Zalo quotes only text. Send the attachment as its own message.",
+      );
     }
     return this.send(threadId, userId, {
       text: this.renderSendableText(message),
@@ -659,13 +752,6 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
    * carry before spending a request.
    */
   private renderSendableText(message: AdapterPostableMessage): string {
-    if (extractFiles(message).length > 0) {
-      throw new NotImplementedError(
-        "Sending attachments through Zalo OA is not supported yet",
-        ADAPTER_NAME,
-      );
-    }
-
     // A card is flattened to text, buttons included, since a consultation
     // message has no interactive form.
     const text = this.converter.renderPostable(message);
@@ -682,10 +768,96 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     return text;
   }
 
+  /**
+   * Upload one attachment and send it.
+   *
+   * Everything Zalo would refuse is checked before the upload, since each
+   * upload spends from a monthly quota.
+   */
+  private async sendMedia(
+    threadId: string,
+    userId: string,
+    message: AdapterPostableMessage,
+    files: FileUpload[],
+  ): Promise<RawMessage<ZaloOaRawMessage>> {
+    if (files.length > 1) {
+      throw new ValidationError(
+        ADAPTER_NAME,
+        `Zalo sends one attachment per message; got ${files.length}. Send them as separate messages.`,
+      );
+    }
+
+    const file = files[0] as FileUpload;
+    const data = await toBuffer(file.data);
+    if (!data) {
+      throw new ValidationError(ADAPTER_NAME, `Could not read the attachment "${file.filename}".`);
+    }
+    const media = prepareMedia(data, file.filename, file.mimeType);
+
+    const caption = this.converter.renderPostable(message);
+    const hasCaption = caption.trim().length > 0;
+    if (media.kind === "file" && hasCaption) {
+      throw new ValidationError(
+        ADAPTER_NAME,
+        "Zalo cannot attach text to a file. Send the text as its own message.",
+      );
+    }
+    if (caption.length > MAX_TEXT_LENGTH) {
+      throw new ValidationError(
+        ADAPTER_NAME,
+        `The caption is ${caption.length} characters; Zalo allows at most ${MAX_TEXT_LENGTH}.`,
+      );
+    }
+
+    const id = await uploadMedia(this.api, media);
+
+    if (media.kind === "file") {
+      return this.send(threadId, userId, { attachment: { type: "file", payload: { token: id } } });
+    }
+
+    return this.send(threadId, userId, {
+      ...(hasCaption ? { text: caption } : {}),
+      attachment: {
+        type: "template",
+        payload: {
+          template_type: "media",
+          elements: [
+            media.kind === "gif"
+              ? { media_type: "gif", attachment_id: id, width: media.width, height: media.height }
+              : { media_type: "image", attachment_id: id },
+          ],
+        },
+      },
+    });
+  }
+
+  /**
+   * Send a sticker.
+   *
+   * Chat SDK has no sticker concept, so this is its own method. Zalo offers
+   * no API to list stickers: IDs come from stickers.zaloapp.com, or from a
+   * sticker a user sent, via {@link getStickerId}.
+   */
+  async sendSticker(threadId: string, stickerId: string): Promise<RawMessage<ZaloOaRawMessage>> {
+    const userId = this.userIdOf(threadId);
+    if (!stickerId.trim()) {
+      throw new ValidationError(ADAPTER_NAME, "A sticker ID is required to send a sticker.");
+    }
+    return this.send(threadId, userId, {
+      attachment: {
+        type: "template",
+        payload: {
+          template_type: "media",
+          elements: [{ media_type: "sticker", attachment_id: stickerId }],
+        },
+      },
+    });
+  }
+
   private async send(
     threadId: string,
     userId: string,
-    message: { text: string; quote_message_id?: string },
+    message: ZaloOaOutboundMessage,
   ): Promise<RawMessage<ZaloOaRawMessage>> {
     const data = await this.api.request<ZaloOaSendMessageData>({
       method: "POST",
@@ -863,27 +1035,73 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
   }
 
   // -------------------------------------------------------------------------
+  // Reactions
+  // -------------------------------------------------------------------------
+
+  /**
+   * React to a message.
+   *
+   * Zalo offers a fixed set: thumbs_up, heart, laugh, surprised, cry, angry,
+   * and `--b`, which has no documented meaning and can be sent only by its
+   * code. Anything else is refused rather than approximated.
+   */
+  async addReaction(
+    threadId: string,
+    messageId: string,
+    value: EmojiValue | string,
+  ): Promise<void> {
+    await this.react(threadId, messageId, this.reactIconFor(value));
+  }
+
+  /**
+   * Withdraw the OA's reaction from a message.
+   *
+   * Zalo's withdrawal names no emoji, so this removes whatever the OA had
+   * placed, not only `value`. The emoji is still checked, so a typo fails
+   * instead of silently removing a reaction.
+   */
+  async removeReaction(
+    threadId: string,
+    messageId: string,
+    value: EmojiValue | string,
+  ): Promise<void> {
+    this.reactIconFor(value);
+    await this.react(threadId, messageId, ZALO_REMOVE_REACTION);
+  }
+
+  private reactIconFor(value: EmojiValue | string): string {
+    const icon = toZaloReactIcon(value);
+    if (!icon) {
+      const name = typeof value === "string" ? value : value.name;
+      throw new ValidationError(
+        ADAPTER_NAME,
+        `Zalo has no "${name}" reaction. It offers: ${supportedReactions()}.`,
+      );
+    }
+    return icon;
+  }
+
+  private async react(threadId: string, messageId: string, icon: string): Promise<void> {
+    const userId = this.userIdOf(threadId);
+    if (!messageId) {
+      throw new ValidationError(ADAPTER_NAME, "A message ID is required to react to a message.");
+    }
+    await this.api.request({
+      method: "POST",
+      path: "v2.0/oa/message",
+      body: {
+        recipient: { user_id: userId },
+        sender_action: { react_icon: icon, react_message_id: messageId },
+      },
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // Unsupported
   //
   // Chat SDK requires these methods. They throw so a caller finds out
-  // immediately, instead of believing an edit or reaction was recorded.
+  // immediately, instead of believing an edit was recorded.
   // -------------------------------------------------------------------------
-
-  addReaction(_threadId: string, _messageId: string, _emoji: EmojiValue | string): Promise<void> {
-    return Promise.reject(
-      new NotImplementedError("Zalo OA reactions are not supported yet", ADAPTER_NAME),
-    );
-  }
-
-  removeReaction(
-    _threadId: string,
-    _messageId: string,
-    _emoji: EmojiValue | string,
-  ): Promise<void> {
-    return Promise.reject(
-      new NotImplementedError("Zalo OA reactions are not supported yet", ADAPTER_NAME),
-    );
-  }
 
   editMessage(
     _threadId: string,
