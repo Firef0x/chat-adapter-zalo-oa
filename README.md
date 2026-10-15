@@ -50,6 +50,8 @@ export async function POST(request: Request) {
 
 Zalo requires a paid OA service package (Growth or Complete) to link an app through the API.
 
+If the app has **app secret proof** checking enabled in its settings, set `appSecretProof: true`. The adapter then sends `HMAC-SHA256(appSecret, accessToken)` as the `appsecret_proof` header on every call, the way Zalo's own SDK does.
+
 ## Configuration
 
 | Option | Env var | Description |
@@ -64,6 +66,7 @@ Zalo requires a paid OA service package (Growth or Complete) to link an app thro
 | `refreshTokenExpiresAt` | | Epoch ms. |
 | `onTokenRefresh` | | Called with the new tokens after every refresh. **Persist them.** |
 | `signatureToleranceSeconds` | | Maximum webhook age. Default `7200`. |
+| `appSecretProof` | | Send an `appsecret_proof` header on every API call. Turn on if the app has that check enabled on developers.zalo.me, where calls without it fail with error `-242`. Default off. |
 | `userName` | | Bot display name. Default `"zalo-oa-bot"`. |
 | `maxDownloadBytes` | | Largest attachment `fetchData()` will buffer. Default 50 MiB. Zalo users can send files of up to 1 GB. |
 | `apiBaseUrl`, `oauthBaseUrl`, `businessApiBaseUrl` | | Override the API hosts, for a proxy. |
@@ -106,7 +109,7 @@ Zalo enforces these, not the adapter:
 
 Zalo's group chats (GMF) are groups the OA owns, created through the OA and paid for by its service package. A group thread ID has the form `zalo-oa:<oaId>:group:<groupId>`, and `isDM()` is `false` for it.
 
-- **Receiving:** members' messages arrive like one-to-one messages, attachments included. A message whose text contains `[@<oaId>]` mentions the OA and is delivered with `isMention: true`, so `onNewMention` fires for it. `[@<groupId>]`, which addresses every member, does not count as a mention of the bot.
+- **Receiving:** members' messages arrive like one-to-one messages, attachments included. An inbound document carries the MIME type of its extension. A message whose text contains `[@<oaId>]` mentions the OA and is delivered with `isMention: true`, so `onNewMention` fires for it. `[@<groupId>]`, which addresses every member, does not count as a mention of the bot.
 - **Sending:** text, images, GIFs, files and stickers work as they do one to one. Mention a member by writing `[@<userId>]` in the text, or everyone with `[@<groupId>]`. Zalo has no messaging window for groups.
 - **Not offered by Zalo in groups:** quoted replies, reactions and template messages. These throw `NotImplementedError` for a group thread.
 - **History:** read five at a time, the page size Zalo documents for groups.
@@ -216,7 +219,7 @@ Zalo reports failures as HTTP 200 with a non-zero `error`. The adapter maps them
 | --- | --- |
 | `AdapterRateLimitError` | `-32`, retried with backoff first |
 | `AuthenticationError` | `-216`, `-220`, after one automatic refresh |
-| `PermissionError` | App, OA or group misconfigured: `-204`, `-205`, `-209`, `-212`, `-219`, `-221`, `-223`, `-224`, `-235`, `-237`, `-242`, `-320`, `-321` |
+| `PermissionError` | App, OA or group misconfigured: `-204`, `-205`, `-209`, `-212`, `-219`, `-221`, `-223`, `-224`, `-235`, `-237`, `-242` (see `appSecretProof`), `-320`, `-321` |
 | `ValidationError` | Request or recipient refused: `-100`, `-201`, `-210`, `-211`, `-213`, `-218`, `-227`, `-230`, `-232`, `-233`, `-234`, `-244`, `-248`, `-249`, `-403` |
 | `NetworkError` | Transport failures, `-200`, and unknown codes. These are worth retrying. |
 

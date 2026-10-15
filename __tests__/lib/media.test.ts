@@ -5,6 +5,7 @@ import { ZaloOaApiClient } from "../../src/lib/api-client.js";
 import {
   gifDimensions,
   MEDIA_LIMITS,
+  mimeTypeForExtension,
   prepareMedia,
   toBuffer,
   uploadMedia,
@@ -165,6 +166,21 @@ describe("uploadMedia", () => {
     expect(
       await uploadMedia(client({ attachment_id: "a" }).api, prepareMedia(gif(1, 1), "a.gif")),
     ).toBe("a");
+  });
+
+  it("names a nameless upload so the multipart part is well formed", async () => {
+    const { api, fetchImpl } = client({ attachment_id: "id" });
+    await uploadMedia(api, prepareMedia(gif(1, 1), "  "));
+    const init = (fetchImpl.mock.calls[0] as unknown as [string, RequestInit])[1];
+    expect(((init.body as FormData).get("file") as File).name).toBe("image.gif");
+  });
+
+  it("maps document extensions to MIME types, case-insensitively", () => {
+    expect(mimeTypeForExtension("PDF")).toBe("application/pdf");
+    expect(mimeTypeForExtension("csv")).toBe("text/csv");
+    expect(mimeTypeForExtension("exe")).toBeUndefined();
+    expect(mimeTypeForExtension("constructor")).toBeUndefined();
+    expect(mimeTypeForExtension(undefined)).toBeUndefined();
   });
 
   it("treats a success with no identifier as a failure", async () => {

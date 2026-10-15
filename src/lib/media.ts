@@ -32,7 +32,7 @@ const UPLOAD_PATHS: Readonly<Record<ZaloOaMediaKind, string>> = {
 };
 
 /** Documents Zalo accepts, by extension. */
-const FILE_TYPES: Readonly<Record<string, string>> = {
+export const FILE_TYPES: Readonly<Record<string, string>> = {
   pdf: "application/pdf",
   doc: "application/msword",
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -105,6 +105,17 @@ export function gifDimensions(data: Buffer): { width: number; height: number } |
   return width > 0 && height > 0 ? { width, height } : null;
 }
 
+/** The MIME type for a document extension Zalo reports, such as `"docx"`. */
+export function mimeTypeForExtension(extension: string | undefined): string | undefined {
+  return extension ? lookup(FILE_TYPES, extension.toLowerCase()) : undefined;
+}
+
+const DEFAULT_FILENAMES: Readonly<Record<ZaloOaMediaKind, string>> = {
+  image: "image",
+  gif: "image.gif",
+  file: "file",
+};
+
 function extensionOf(filename: string): string {
   const dot = filename.lastIndexOf(".");
   return dot === -1 ? "" : filename.slice(dot + 1).toLowerCase();
@@ -173,10 +184,12 @@ export function prepareMedia(data: Buffer, filename: string, mimeType?: string):
  */
 export async function uploadMedia(client: ZaloOaApiClient, media: PreparedMedia): Promise<string> {
   const form = new FormData();
+  // A nameless part is a malformed multipart field to some servers, so a
+  // missing filename gets a generic one.
   form.set(
     "file",
     new Blob([new Uint8Array(media.data)], { type: media.mimeType }),
-    media.filename,
+    media.filename.trim() || DEFAULT_FILENAMES[media.kind],
   );
 
   const data = await client.request<{ attachment_id?: string; token?: string }>({

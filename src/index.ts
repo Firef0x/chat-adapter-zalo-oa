@@ -2,6 +2,7 @@ export { ZALO_BUSINESS_API_HOST, ZaloOaAdapter } from "./adapter.js";
 export { createZaloOaAdapter, zaloOa } from "./factory.js";
 export {
   type AccessTokenProvider,
+  computeAppSecretProof,
   mapZaloOaError,
   ZALO_OA_API_HOST,
   ZaloOaApiClient,
@@ -11,9 +12,11 @@ export {
 export { cardToPlainText } from "./lib/card-to-text.js";
 export { ZaloOaFormatConverter } from "./lib/format-converter.js";
 export {
+  FILE_TYPES,
   getStickerId,
   gifDimensions,
   MEDIA_LIMITS,
+  mimeTypeForExtension,
   type PreparedMedia,
   prepareMedia,
   uploadMedia,

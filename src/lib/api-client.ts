@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+
 import {
   AdapterRateLimitError,
   AuthenticationError,
@@ -27,6 +29,16 @@ export interface AccessTokenProvider {
 
 export interface ZaloOaApiClientOptions {
   tokens: AccessTokenProvider;
+  /**
+   * Prove possession of the app secret on every call.
+   *
+   * Zalo lets an app require this, and then refuses calls without it with
+   * error -242. The proof is `HMAC-SHA256(appSecret, accessToken)`, sent as
+   * the `appsecret_proof` header — the scheme Zalo's own SDK implements.
+   */
+  appSecretProof?: boolean;
+  /** Required when `appSecretProof` is set. */
+  appSecret?: string;
   baseUrl?: string;
   fetchImpl?: typeof fetch;
   /** How many times to retry a throttled request. Defaults to 2; `0` disables retrying. */
@@ -132,6 +144,11 @@ export function mapZaloOaError(code: number, message: string): Error {
   return new NetworkError(ADAPTER_NAME, `Unrecognized Zalo OA error: ${detail}`);
 }
 
+/** `HMAC-SHA256(appSecret, accessToken)` as lowercase hex: Zalo's `appsecret_proof`. */
+export function computeAppSecretProof(appSecret: string, accessToken: string): string {
+  return crypto.createHmac("sha256", appSecret).update(accessToken).digest("hex");
+}
+
 /** A non-negative integer, falling back when the value is not a usable one. */
 function clampCount(value: number | undefined, fallback: number): number {
   return Number.isFinite(value) ? Math.max(0, Math.trunc(value as number)) : fallback;
@@ -155,9 +172,14 @@ export class ZaloOaApiClient {
   private readonly maxRateLimitRetries: number;
   private readonly rateLimitRetryDelayMs: number;
   private readonly sleepImpl: (ms: number) => Promise<void>;
+  private readonly appSecret: string | null;
 
   constructor(options: ZaloOaApiClientOptions) {
     this.tokens = options.tokens;
+    if (options.appSecretProof && !options.appSecret) {
+      throw new ValidationError(ADAPTER_NAME, "appSecretProof requires the app secret.");
+    }
+    this.appSecret = options.appSecretProof ? (options.appSecret as string) : null;
     this.baseUrl = (options.baseUrl ?? ZALO_OA_API_HOST).replace(/\/+$/, "");
     this.fetchImpl = options.fetchImpl ?? fetch;
     // `??` lets NaN through, and `attempt >= NaN` is never true — an unbounded
@@ -228,6 +250,11 @@ export class ZaloOaApiClient {
     accessToken: string,
   ): Promise<ZaloOaApiEnvelope<TData>> {
     const headers: Record<string, string> = { access_token: accessToken };
+    if (this.appSecret !== null) {
+      // Computed per request rather than cached: the token it proves can be
+      // replaced by a refresh between two calls.
+      headers.appsecret_proof = computeAppSecretProof(this.appSecret, accessToken);
+    }
     let body: BodyInit | undefined;
     if (req.formData) {
       body = req.formData;

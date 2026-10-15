@@ -70,6 +70,14 @@ export interface ZaloOaAdapterConfig {
    * next restart.
    */
   onTokenRefresh?: (tokens: ZaloOaTokens) => void | Promise<void>;
+  /**
+   * Send an `appsecret_proof` header on every API call.
+   *
+   * Turn this on if the app has "app secret proof" checking enabled on
+   * developers.zalo.me; Zalo then refuses calls without it with error -242.
+   * Off by default, as in Zalo's own SDK.
+   */
+  appSecretProof?: boolean;
   /** Display name for the bot. Defaults to `"zalo-oa-bot"`. */
   userName?: string;
   logger?: Logger;
@@ -256,7 +264,8 @@ export interface ZaloOaHistoryMessage {
   url?: string;
   description?: string;
   from_id: string | number;
-  to_id: string | number;
+  /** Absent on entries of a group conversation. */
+  to_id?: string | number;
   from_display_name?: string;
   from_avatar?: string;
   to_display_name?: string;

@@ -23,7 +23,7 @@ import { ZaloOaApiClient } from "./lib/api-client.js";
 import { BoundedSet } from "./lib/bounded-set.js";
 import { ZaloOaFormatConverter } from "./lib/format-converter.js";
 import { lookup } from "./lib/lookup.js";
-import { prepareMedia, toBuffer, uploadMedia } from "./lib/media.js";
+import { mimeTypeForExtension, prepareMedia, toBuffer, uploadMedia } from "./lib/media.js";
 import {
   fromZaloReactIcon,
   supportedReactions,
@@ -178,8 +178,14 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
   private readonly fetchImpl: typeof fetch;
   private readonly maxDownloadBytes: number;
 
-  /** Message IDs already dispatched, so a redelivery is not handled twice. */
-  private readonly seenMessages = new BoundedSet(1000);
+  /**
+   * Message IDs already dispatched, so a redelivery is not handled twice.
+   *
+   * Sized for a busy OA: Zalo retries for up to two hours, and a GMF group
+   * can have a thousand members, so a thousand entries could be evicted
+   * before the last retry of a delivery arrives.
+   */
+  private readonly seenMessages = new BoundedSet(5000);
 
   constructor(config: ZaloOaAdapterConfig & { fetchImpl?: typeof fetch }) {
     // The factory validates too, but the class is exported directly. An empty
@@ -220,6 +226,8 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
 
     this.api = new ZaloOaApiClient({
       tokens: this.tokens,
+      appSecretProof: config.appSecretProof,
+      appSecret: config.appSecret,
       baseUrl: config.apiBaseUrl,
       fetchImpl: config.fetchImpl,
       maxRateLimitRetries: config.maxRateLimitRetries,
@@ -322,9 +330,15 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     // is safe; acting on it before verification is not, and nothing does.
     let event: ZaloOaWebhookEvent;
     try {
-      event = JSON.parse(rawBody) as ZaloOaWebhookEvent;
+      const parsed: unknown = JSON.parse(rawBody);
+      // `null` and scalars are valid JSON but not a delivery, and the first
+      // would throw on every field read below.
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new TypeError("not an object");
+      }
+      event = parsed as ZaloOaWebhookEvent;
     } catch {
-      this.logger.warn("Rejected a Zalo OA webhook whose body is not JSON");
+      this.logger.warn("Rejected a Zalo OA webhook whose body is not a JSON object");
       return new Response("Bad request", { status: 400 });
     }
 
@@ -347,7 +361,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
         // against the webhook's health without achieving anything.
         this.logger.warn("Dropped a stale Zalo OA webhook", {
           reason: verification.reason,
-          event: event?.event_name,
+          event: event.event_name,
         });
         return new Response("OK", { status: 200 });
       }
@@ -602,7 +616,12 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
         url,
         name: attachment.payload?.name,
         size: Number.isFinite(size) && size > 0 ? size : undefined,
-        mimeType: attachment.type === "gif" ? "image/gif" : undefined,
+        mimeType:
+          attachment.type === "gif"
+            ? "image/gif"
+            : attachment.type === "file"
+              ? mimeTypeForExtension(attachment.payload?.type)
+              : undefined,
         fetchData: () => this.download(url),
       },
     ];
@@ -637,8 +656,13 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
       throw new ValidationError(ADAPTER_NAME, "A Zalo OA history entry names no conversation.");
     }
     // In a group the sender is one member among many, so it is read from the
-    // entry; in a one-to-one thread it can only be the thread's user.
+    // entry; in a one-to-one thread it can only be the thread's user. An
+    // unnamed sender is refused rather than given the empty ID that every
+    // other unnamed sender would share.
     const userId = thread.type === "group" ? idOf(entry.from_id) : thread.id;
+    if (fromUser && !userId) {
+      throw new ValidationError(ADAPTER_NAME, "A Zalo OA history entry names no sender.");
+    }
     const kind = lookup(HISTORY_ATTACHMENT_KINDS, String(entry.type));
     const url = entry.url;
     const text =
@@ -664,7 +688,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
         };
 
     return new Message<ZaloOaRawMessage>({
-      id: entry.message_id,
+      id: idOf(entry.message_id),
       threadId:
         thread.type === "group" ? this.groupThreadId(thread.id) : this.userThreadId(thread.id),
       text,
@@ -691,7 +715,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
 
   private parseSentMessage(data: ZaloOaSendMessageData): Message<ZaloOaRawMessage> {
     return new Message<ZaloOaRawMessage>({
-      id: data.message_id,
+      id: idOf(data.message_id),
       threadId: data.group_id
         ? this.groupThreadId(idOf(data.group_id))
         : this.userThreadId(idOf(data.user_id)),
@@ -727,6 +751,13 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
   }
 
   private async download(url: string): Promise<Buffer> {
+    // A persisted attachment's URL is whatever the host stored. Only a web
+    // URL can be a Zalo CDN link; anything else would make fetch read a
+    // local file or a data: payload on the host's behalf.
+    if (!/^https?:\/\//i.test(url)) {
+      throw new ValidationError(ADAPTER_NAME, `Refusing to download a non-HTTP URL: ${url}`);
+    }
+
     let response: Response;
     try {
       response = await this.fetchImpl(url);
@@ -966,7 +997,8 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
   }
 
   private sentMessage(threadId: string, data: ZaloOaSendMessageData): RawMessage<ZaloOaRawMessage> {
-    if (!data?.message_id) {
+    const messageId = idOf(data?.message_id);
+    if (!messageId) {
       // Success with no ID means delivery is unconfirmed, and the host has
       // nothing to quote, edit, or correlate with a later read receipt.
       throw new NetworkError(
@@ -975,7 +1007,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
       );
     }
 
-    return { id: data.message_id, raw: data, threadId };
+    return { id: messageId, raw: data, threadId };
   }
 
   /**
@@ -989,11 +1021,12 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
    */
   async sendTemplate(
     threadId: string,
-    templateId: string,
+    templateId: string | number,
     data: ZaloOaTemplateData,
   ): Promise<RawMessage<ZaloOaRawMessage>> {
     const userId = this.userIdOf(threadId, "template messages");
-    const id = String(templateId ?? "").trim();
+    // `listTemplates()` reports IDs as numbers, so both spellings are taken.
+    const id = idOf(templateId).trim();
     if (!id) {
       throw new ValidationError(ADAPTER_NAME, "A template ID is required to send a template.");
     }
@@ -1160,7 +1193,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
   }
 
   async fetchThread(threadId: string): Promise<ThreadInfo> {
-    const { type } = this.decodeThreadId(threadId);
+    const { type } = this.targetOf(threadId);
     return {
       id: threadId,
       channelId: this.channelIdFromThreadId(threadId),

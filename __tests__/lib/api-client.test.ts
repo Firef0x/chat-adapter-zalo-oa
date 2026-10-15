@@ -7,7 +7,13 @@ import {
 } from "@chat-adapter/shared";
 import { describe, expect, it, vi } from "vitest";
 
-import { mapZaloOaError, ZaloOaApiClient } from "../../src/lib/api-client.js";
+import crypto from "node:crypto";
+
+import {
+  computeAppSecretProof,
+  mapZaloOaError,
+  ZaloOaApiClient,
+} from "../../src/lib/api-client.js";
 import { ZALO_OA_ERROR } from "../../src/types.js";
 
 function envelope(error: number, data: unknown = {}, message = error === 0 ? "Success" : "nope") {
@@ -59,7 +65,42 @@ describe("mapZaloOaError", () => {
   });
 });
 
+describe("computeAppSecretProof", () => {
+  it("is HMAC-SHA256 keyed by the app secret over the token, as Zalo's SDK computes it", () => {
+    const expected = crypto.createHmac("sha256", "secret").update("token").digest("hex");
+    expect(computeAppSecretProof("secret", "token")).toBe(expected);
+    // Keyed the other way round is a different, wrong value.
+    expect(computeAppSecretProof("token", "secret")).not.toBe(expected);
+  });
+});
+
 describe("ZaloOaApiClient", () => {
+  it("refuses to enable the proof without the secret it is made from", () => {
+    expect(() => client(vi.fn(), tokens(), { appSecretProof: true })).toThrow(ValidationError);
+  });
+
+  it("recomputes the proof for the token a refresh handed back", async () => {
+    const provider = tokens("tok_1", "tok_2");
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(envelope(ZALO_OA_ERROR.ACCESS_TOKEN_EXPIRED))
+      .mockResolvedValueOnce(envelope(0, {}));
+    await client(fetchImpl, provider, { appSecretProof: true, appSecret: "s" }).request({
+      method: "GET",
+      path: "x",
+    });
+
+    const proofs = fetchImpl.mock.calls.map(
+      (call) =>
+        ((call as unknown as [string, RequestInit])[1].headers as Record<string, string>)
+          .appsecret_proof,
+    );
+    expect(proofs).toEqual([
+      computeAppSecretProof("s", "tok_1"),
+      computeAppSecretProof("s", "tok_2"),
+    ]);
+  });
+
   it("sends a JSON POST with the access_token header", async () => {
     const fetchImpl = vi.fn(async () => envelope(0, { message_id: "m1" }));
     const data = await client(fetchImpl).request({

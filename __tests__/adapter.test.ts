@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+
 import { NetworkError, ValidationError } from "@chat-adapter/shared";
 import type { Message } from "chat";
 import { emoji, NotImplementedError } from "chat";
@@ -162,6 +164,13 @@ describe("ZaloOaAdapter", () => {
       await expect(adapter.openDM(USER_ID)).resolves.toBe(THREAD_ID);
     });
 
+    it("refuses to describe another OA's thread", async () => {
+      const { adapter } = build();
+      await expect(adapter.fetchThread(`zalo-oa:111:user:${USER_ID}`)).rejects.toThrow(
+        /different Official Account/,
+      );
+    });
+
     it("describes a thread without a request", async () => {
       const { adapter, fetchImpl } = build();
       await expect(adapter.fetchThread(THREAD_ID)).resolves.toEqual({
@@ -237,13 +246,17 @@ describe("ZaloOaAdapter", () => {
       expect(response.status).toBe(401);
     });
 
-    it("rejects a JSON null body as unsigned rather than crashing", async () => {
-      const { adapter } = await initialized();
-      const response = await adapter.handleWebhook(
-        webhookRequest(null, { rawBody: "null", header: "mac=" + "0".repeat(64) }),
-      );
-      expect(response.status).toBe(401);
-    });
+    it.each(["null", "42", '"text"', "[1]"])(
+      "answers the JSON non-object body %s with 400 without reading it",
+      async (rawBody) => {
+        const { adapter, logger } = await initialized();
+        const response = await adapter.handleWebhook(
+          webhookRequest(null, { rawBody, header: "mac=" + "0".repeat(64) }),
+        );
+        expect(response.status).toBe(400);
+        expect(logger.error).not.toHaveBeenCalled();
+      },
+    );
   });
 
   describe("inbound messages", () => {
@@ -355,6 +368,26 @@ describe("ZaloOaAdapter", () => {
         ),
       );
       expect(processed[0]?.message.attachments).toEqual([]);
+    });
+
+    it("gives an inbound document the MIME type of its extension", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(
+        webhookRequest(
+          userEvent({
+            event_name: "user_send_file",
+            message: {
+              msg_id: "f",
+              attachments: [
+                { type: "file", payload: { url: "https://x/f", name: "a.docx", type: "DOCX" } },
+              ],
+            },
+          }),
+        ),
+      );
+      expect(processed[0]?.message.attachments[0]?.mimeType).toBe(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      );
     });
 
     it("keeps a file's name and size", async () => {
@@ -606,6 +639,12 @@ describe("ZaloOaAdapter", () => {
     it("surfaces an expired interaction window as a ValidationError", async () => {
       fetchImpl.mockResolvedValue(fail(ZALO_OA_ERROR.NO_RECENT_INTERACTION));
       await expect(adapter.postMessage(THREAD_ID, "hi")).rejects.toBeInstanceOf(ValidationError);
+    });
+
+    it("reports a numeric message_id as a string", async () => {
+      fetchImpl.mockResolvedValue(ok({ message_id: 123456, user_id: USER_ID }));
+      const result = await adapter.postMessage(THREAD_ID, "hi");
+      expect(result.id).toBe("123456");
     });
 
     it("treats success without a message_id as unconfirmed", async () => {
@@ -896,6 +935,17 @@ describe("ZaloOaAdapter", () => {
       const restored = adapter.rehydrateAttachment({ type: "image", url: "https://x/a.jpg" });
       await expect(restored.fetchData?.()).resolves.toEqual(bytes);
     });
+
+    it.each(["file:///etc/passwd", "data:text/plain,hi", "ftp://x/y", "javascript:alert(1)"])(
+      "refuses to download %s without fetching",
+      async (url) => {
+        const fetchImpl = vi.fn();
+        const { adapter } = build(fetchImpl);
+        const restored = adapter.rehydrateAttachment({ type: "file", url });
+        await expect(restored.fetchData?.()).rejects.toBeInstanceOf(ValidationError);
+        expect(fetchImpl).not.toHaveBeenCalled();
+      },
+    );
 
     it("leaves an attachment without a URL alone", () => {
       const { adapter } = build();
@@ -1579,6 +1629,39 @@ describe("ZaloOaAdapter", () => {
       expect(nextCursor).toBe("10");
     });
 
+    it("skips a group history entry whose sender is unnamed, keeping the rest", async () => {
+      const fetchImpl = vi.fn(async () =>
+        ok([
+          {
+            src: 1,
+            time: T0 + 1,
+            type: "text",
+            message: "named",
+            message_id: "a",
+            from_id: "7",
+            group_id: GROUP_ID,
+          },
+          {
+            src: 1,
+            time: T0,
+            type: "text",
+            message: "unnamed",
+            message_id: "b",
+            group_id: GROUP_ID,
+          },
+        ]),
+      );
+      const { adapter } = build(fetchImpl);
+      const attached = attachChat();
+      await adapter.initialize(attached.chat as never);
+      const { messages } = await adapter.fetchMessages(GROUP_THREAD);
+      expect(messages.map((m) => m.id)).toEqual(["a"]);
+      expect(attached.logger.warn).toHaveBeenCalledWith(
+        "Skipping an unreadable Zalo OA history entry",
+        expect.objectContaining({ error: expect.any(ValidationError) }),
+      );
+    });
+
     it("files a standalone group history entry under its group", () => {
       const { adapter } = build();
       const message = adapter.parseMessage({
@@ -1635,8 +1718,18 @@ describe("ZaloOaAdapter", () => {
       });
     });
 
+    it("accepts a numeric template ID, as listTemplates reports them", async () => {
+      const fetchImpl = vi.fn(async () => ok({ message_id: "tm", user_id: USER_ID }));
+      const { adapter } = build(fetchImpl);
+      await adapter.sendTemplate(THREAD_ID, 900025, { a: "1" });
+      expect(lastCall(fetchImpl).body.template_id).toBe("900025");
+    });
+
     it.each([
       ["an empty template ID", "  ", {}],
+      // A JavaScript caller can pass these; String() would send "null".
+      ["a null template ID", null as never, {}],
+      ["an undefined template ID", undefined as never, {}],
       ["an array as data", "1", [] as never],
       ["null data", "1", null as never],
     ])("refuses %s before sending", async (_label, id, data) => {
@@ -1711,6 +1804,47 @@ describe("ZaloOaAdapter", () => {
       expect(lastCall(fetchImpl).url.href).toBe(
         "https://proxy.example/template/all?offset=0&limit=100",
       );
+    });
+  });
+
+  describe("app secret proof", () => {
+    it("is not sent unless enabled", async () => {
+      const fetchImpl = vi.fn(async () => ok({ message_id: "m", user_id: USER_ID }));
+      const { adapter } = build(fetchImpl);
+      await adapter.postMessage(THREAD_ID, "hi");
+      expect(lastCall(fetchImpl).init.headers).not.toHaveProperty("appsecret_proof");
+    });
+
+    it("sends HMAC-SHA256(appSecret, accessToken) on a JSON send, an upload and the business host", async () => {
+      const fetchImpl = vi.fn(async (url: string) =>
+        url.includes("/upload/")
+          ? ok({ attachment_id: "att" })
+          : url.includes("/template/all")
+            ? ok([])
+            : ok({ message_id: "m", user_id: USER_ID }),
+      );
+      const adapter = new ZaloOaAdapter({
+        appId: APP_ID,
+        appSecret: "app_secret",
+        oaSecretKey: OA_SECRET,
+        oaId: OA_ID,
+        accessToken: "acc_1",
+        refreshToken: "ref_1",
+        accessTokenExpiresAt: Date.now() + 3_600_000,
+        appSecretProof: true,
+        fetchImpl: fetchImpl as never,
+      });
+      const expected = crypto.createHmac("sha256", "app_secret").update("acc_1").digest("hex");
+
+      await adapter.postMessage(THREAD_ID, "hi");
+      await adapter.postMessage(THREAD_ID, { raw: "", files: [{ data: PNG, filename: "a.png" }] });
+      await adapter.listTemplates();
+
+      for (const call of fetchImpl.mock.calls) {
+        const init = call[1] as RequestInit;
+        expect((init.headers as Record<string, string>).appsecret_proof).toBe(expected);
+      }
+      expect(fetchImpl).toHaveBeenCalledTimes(4);
     });
   });
 
