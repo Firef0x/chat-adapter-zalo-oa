@@ -5,20 +5,31 @@ import type { Logger } from "chat";
 // ---------------------------------------------------------------------------
 
 /**
- * Who a thread talks to.
- *
- * `group` is reserved for Zalo's GMF group chats. It is part of the thread ID
- * from the start so that adding group support later cannot change the shape
- * of IDs a host has already persisted.
+ * Who a thread talks to: an identified user, a GMF group chat, or an
+ * anonymous user — one who wrote through the OA's chat widget without
+ * signing in, whom Zalo identifies only by an anonymous ID and a
+ * conversation ID together.
  */
-export type ZaloOaThreadType = "user" | "group";
+export type ZaloOaThreadType = "user" | "group" | "anonymous";
 
 export interface ZaloOaThreadId {
   /** The Official Account that owns the conversation. */
   oaId: string;
   type: ZaloOaThreadType;
-  /** The OA-scoped user ID for `user`, or the group ID for `group`. */
+  /** The user ID, the group ID, or the anonymous ID. */
   id: string;
+  /** Required for `anonymous`: Zalo addresses such a user only within a conversation. */
+  conversationId?: string;
+}
+
+/** A user read messages the OA sent. */
+export interface ZaloOaReadReceiptEvent {
+  threadId: string;
+  userId: string;
+  /** The messages the user saw, by ID. */
+  messageIds: string[];
+  readAt: Date;
+  raw: ZaloOaWebhookEvent;
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +82,16 @@ export interface ZaloOaAdapterConfig {
    */
   onTokenRefresh?: (tokens: ZaloOaTokens) => void | Promise<void>;
   /**
+   * Called when a user reads messages the OA sent.
+   *
+   * Chat SDK has no inbound read-receipt event, so it goes here. Zalo emits
+   * it only when the user reads on Zalo Mobile, and only to the app that
+   * sent the message. A receipt is a high-water mark, so apply it as
+   * `max(existing, readAt)`: a redelivery may arrive after a newer one. A
+   * handler that throws is logged; Zalo does not redeliver on request.
+   */
+  onReadReceipt?: (event: ZaloOaReadReceiptEvent) => void | Promise<void>;
+  /**
    * Send an `appsecret_proof` header on every API call.
    *
    * Turn this on if the app has "app secret proof" checking enabled on
@@ -120,6 +141,8 @@ export interface ZaloOaApiEnvelope<TData> {
   error: number;
   message: string;
   data: TData;
+  /** Set by the template listing: the count across every page. */
+  metadata?: { total?: number };
 }
 
 /**
@@ -191,6 +214,8 @@ export interface ZaloOaSendMessageData {
   message_id: string;
   user_id?: string;
   group_id?: string;
+  anonymous_id?: string;
+  conversation_id?: string;
   /** Epoch milliseconds, as a string. */
   sent_time?: string;
   quota?: {
@@ -206,6 +231,7 @@ export interface ZaloOaSendMessageData {
 /** One element of a `media` template: an image, GIF or sticker. */
 export type ZaloOaMediaElement =
   | { media_type: "image"; attachment_id: string }
+  | { media_type: "image"; url: string }
   | { media_type: "gif"; attachment_id: string; width?: number; height?: number }
   | { media_type: "sticker"; attachment_id: string };
 
@@ -278,6 +304,95 @@ export interface ZaloOaHistoryMessage {
 /** Values for a ZBS template's parameters, as registered with Zalo. */
 export type ZaloOaTemplateData = Record<string, string | number>;
 
+/** `data` of `POST business.openapi.zalo.me/message/template`. */
+export interface ZaloOaPhoneTemplateData {
+  msg_id: string;
+  /** Epoch milliseconds, as a string. */
+  sent_time?: string;
+  /** `"1"` normal, `"3"` over-quota (whitelisted OAs only). */
+  sending_mode?: string;
+  quota?: { dailyQuota?: string; remainingQuota?: string };
+}
+
+/** What `sendTemplateByPhone` returns. A phone send belongs to no thread. */
+export interface ZaloOaPhoneTemplateResult {
+  messageId: string;
+  /** The reconciliation ID sent with the request, generated when none was given. */
+  trackingId: string;
+  sentAt?: Date;
+  /** Daily quota left for sends by phone, when Zalo reports it. */
+  remainingDailyQuota?: number;
+  raw: ZaloOaPhoneTemplateData;
+}
+
+// ---------------------------------------------------------------------------
+// Groups
+// ---------------------------------------------------------------------------
+
+/** A GMF package the OA can run a group on. */
+export interface ZaloOaGroupAsset {
+  product_type: "gmf10" | "gmf50" | "gmf100" | string;
+  quota_type: "sub_quota" | "purchase_quota" | "reward_quota" | string;
+  asset_id: string;
+  /** `dd/MM/yyyy`. */
+  valid_through?: string;
+  auto_renew?: boolean | string;
+  status: "available" | "used" | string;
+  /** The group using this package, when `status` is `used`. */
+  used_id?: string;
+}
+
+export interface ZaloOaGroupSummary {
+  group_id: string;
+  name: string;
+  avatar?: string;
+  group_link?: string;
+  group_description?: string;
+  total_member?: number;
+  /** `enabled` means the OA can manage and message the group. */
+  status: "enabled" | "disabled" | string;
+}
+
+export interface ZaloOaGroupInfo extends ZaloOaGroupSummary {
+  max_member?: string | number;
+  /** `dd/MM/yyyy`: when an unrenewed group is dissolved. */
+  auto_delete_date?: string;
+}
+
+export interface ZaloOaGroupSettings {
+  lock_send_msg?: boolean;
+  join_appr?: boolean;
+  enable_msg_history?: boolean;
+  enable_link_join?: boolean;
+}
+
+/** `data` of the group info, update and renew endpoints. */
+export interface ZaloOaGroupDetail {
+  group_info: ZaloOaGroupInfo;
+  asset_info?: {
+    asset_type?: string;
+    asset_id?: string;
+    valid_through?: string;
+    auto_renew?: boolean | string;
+  };
+  group_setting?: ZaloOaGroupSettings;
+}
+
+/** A group member. The OA itself is listed with `oa_id` instead of `user_id`. */
+export interface ZaloOaGroupMember {
+  user_id?: string;
+  oa_id?: string;
+  name?: string;
+  avatar?: string;
+}
+
+/** A page of a group listing. */
+export interface ZaloOaGroupPage<TItem> {
+  items: TItem[];
+  /** The count across every page. */
+  total: number;
+}
+
 export type ZaloOaTemplateStatus = "ENABLE" | "PENDING_REVIEW" | "REJECT" | "DISABLE";
 
 /** One entry of `GET business.openapi.zalo.me/template/all`. */
@@ -293,6 +408,13 @@ export interface ZaloOaTemplateSummary {
 // ---------------------------------------------------------------------------
 // Webhooks
 // ---------------------------------------------------------------------------
+
+/** Messages from an anonymous user of the OA's chat widget. */
+export type ZaloOaAnonymousMessageEventName =
+  | "anonymous_send_text"
+  | "anonymous_send_image"
+  | "anonymous_send_file"
+  | "anonymous_send_sticker";
 
 /** One-to-one message events from the user. */
 export type ZaloOaUserMessageEventName =
@@ -337,6 +459,10 @@ export interface ZaloOaWebhookMessage {
   /** Present when the user replied to a specific message. */
   quote_msg_id?: string;
   attachments?: ZaloOaWebhookAttachment[];
+  /** Set on anonymous events: the conversation the anonymous ID is valid in. */
+  conversation_id?: string;
+  /** Set on `user_seen_message`: the messages the user read. */
+  msg_ids?: string[];
 }
 
 /**

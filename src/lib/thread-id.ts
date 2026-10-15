@@ -14,7 +14,7 @@ export const ADAPTER_NAME = "zalo-oa";
  */
 const SEGMENT = /^[A-Za-z0-9_-]+$/;
 
-const THREAD_TYPES: ReadonlySet<string> = new Set<ZaloOaThreadType>(["user", "group"]);
+const THREAD_TYPES: ReadonlySet<string> = new Set<ZaloOaThreadType>(["user", "group", "anonymous"]);
 
 function assertSegment(value: string, field: string): void {
   if (!value) {
@@ -25,35 +25,50 @@ function assertSegment(value: string, field: string): void {
   }
 }
 
-/** Encode an OA conversation as a Chat SDK thread ID: `zalo-oa:<oaId>:<type>:<id>`. */
+/**
+ * Encode an OA conversation as a Chat SDK thread ID.
+ *
+ * `zalo-oa:<oaId>:user:<userId>`, `zalo-oa:<oaId>:group:<groupId>`, or
+ * `zalo-oa:<oaId>:anonymous:<anonymousId>:<conversationId>` — the last
+ * carries both IDs because Zalo addresses an anonymous user only with the
+ * pair, and a thread ID has to be enough to send a reply.
+ */
 export function encodeThreadId(data: ZaloOaThreadId): string {
   assertSegment(data.oaId, "oaId");
   if (!THREAD_TYPES.has(data.type)) {
     throw new ValidationError(ADAPTER_NAME, `Unknown Zalo OA thread type: ${data.type}`);
   }
   assertSegment(data.id, "id");
+  if (data.type === "anonymous") {
+    assertSegment(data.conversationId ?? "", "conversationId");
+    return `${ADAPTER_NAME}:${data.oaId}:anonymous:${data.id}:${data.conversationId}`;
+  }
   return `${ADAPTER_NAME}:${data.oaId}:${data.type}:${data.id}`;
 }
 
 /** Decode a thread ID produced by {@link encodeThreadId}. */
 export function decodeThreadId(threadId: string): ZaloOaThreadId {
   const parts = threadId.split(":");
-  const [prefix, oaId, type, id] = parts;
+  const [prefix, oaId, type, id, conversationId] = parts;
+  const expectedParts = type === "anonymous" ? 5 : 4;
 
   if (
-    parts.length !== 4 ||
+    parts.length !== expectedParts ||
     prefix !== ADAPTER_NAME ||
     !oaId ||
     !id ||
     !type ||
     !THREAD_TYPES.has(type) ||
     !SEGMENT.test(oaId) ||
-    !SEGMENT.test(id)
+    !SEGMENT.test(id) ||
+    (type === "anonymous" && (!conversationId || !SEGMENT.test(conversationId)))
   ) {
     throw new ValidationError(ADAPTER_NAME, `Invalid Zalo OA thread ID: ${threadId}`);
   }
 
-  return { oaId, type: type as ZaloOaThreadType, id };
+  return type === "anonymous"
+    ? { oaId, type, id, conversationId: conversationId as string }
+    : { oaId, type: type as ZaloOaThreadType, id };
 }
 
 /**

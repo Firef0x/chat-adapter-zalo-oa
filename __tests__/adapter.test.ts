@@ -233,6 +233,23 @@ describe("ZaloOaAdapter", () => {
       );
     });
 
+    it.each([
+      ["a GET", new Request("https://example.com/webhooks/zalo", { method: "GET" })],
+      ["a HEAD", new Request("https://example.com/webhooks/zalo", { method: "HEAD" })],
+      ["an empty POST", webhookRequest(null, { rawBody: "", header: null })],
+      ["a whitespace POST", webhookRequest(null, { rawBody: " \n", header: null })],
+    ])(
+      "answers %s, as the console's URL check sends, with 200 and dispatches nothing",
+      async (_label, request) => {
+        const { adapter, processed, logger } = await initialized();
+        const response = await adapter.handleWebhook(request);
+        expect(response.status).toBe(200);
+        expect(processed).toHaveLength(0);
+        expect(logger.warn).not.toHaveBeenCalled();
+        expect(logger.error).not.toHaveBeenCalled();
+      },
+    );
+
     it("answers a non-JSON body with 400", async () => {
       const { adapter } = await initialized();
       const response = await adapter.handleWebhook(webhookRequest({}, { rawBody: "not json" }));
@@ -526,7 +543,7 @@ describe("ZaloOaAdapter", () => {
       await adapter.handleWebhook(webhookRequest(userEvent({ message: { text: "hi" } })));
       expect(processed).toHaveLength(0);
       expect(logger.warn).toHaveBeenCalledWith(
-        "Ignoring a Zalo OA message with no ID or sender",
+        "Ignoring a Zalo OA message with no ID, sender or conversation",
         expect.objectContaining({ messageId: "" }),
       );
     });
@@ -572,6 +589,15 @@ describe("ZaloOaAdapter", () => {
         "Zalo sent an unusable timestamp; substituting a fallback",
         { field: "webhook", value: "0" },
       );
+    });
+
+    it("parses a payload whose event_name is not a string as a one-to-one message", async () => {
+      const { adapter } = await initialized();
+      // parseMessage() is public; a stored payload with a mangled event
+      // name must still decode rather than crash on `.startsWith`.
+      const message = adapter.parseMessage(userEvent({ event_name: 7 as never }));
+      expect(message.threadId).toBe(THREAD_ID);
+      expect(message.isMention).toBeUndefined();
     });
   });
 
@@ -922,6 +948,12 @@ describe("ZaloOaAdapter", () => {
         avatarUrl: "https://a",
       });
     });
+
+    it("refuses an empty user ID without a request", async () => {
+      const { adapter, fetchImpl } = build();
+      await expect(adapter.getUser(" ")).rejects.toBeInstanceOf(ValidationError);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
   });
 
   describe("attachments", () => {
@@ -1166,6 +1198,10 @@ describe("ZaloOaAdapter", () => {
     it("refuses an empty sticker ID", async () => {
       const { adapter, fetchImpl } = build();
       await expect(adapter.sendSticker(THREAD_ID, "  ")).rejects.toBeInstanceOf(ValidationError);
+      // What getStickerId() returns for a message that carried no sticker.
+      await expect(adapter.sendSticker(THREAD_ID, undefined as never)).rejects.toBeInstanceOf(
+        ValidationError,
+      );
       expect(fetchImpl).not.toHaveBeenCalled();
     });
   });
@@ -1460,8 +1496,8 @@ describe("ZaloOaAdapter", () => {
       await adapter.handleWebhook(webhookRequest(groupEvent({ recipient: { id: "" } })));
       expect(processed).toHaveLength(0);
       expect(logger.warn).toHaveBeenCalledWith(
-        "Ignoring a Zalo OA message with no ID or sender",
-        expect.objectContaining({ groupId: "" }),
+        "Ignoring a Zalo OA message with no ID, sender or conversation",
+        expect.objectContaining({ event: "user_send_group_text" }),
       );
     });
 
@@ -1745,14 +1781,25 @@ describe("ZaloOaAdapter", () => {
       await expect(adapter.sendTemplate(THREAD_ID, "1", {})).rejects.toBeInstanceOf(NetworkError);
     });
 
-    it("lists templates from the business host", async () => {
+    it("lists templates from the business host, with the total across pages", async () => {
       const templates = [{ templateId: 900025, templateName: "T1", status: "ENABLE" }];
-      const fetchImpl = vi.fn(async () => ok(templates));
+      const fetchImpl = vi.fn(
+        async () =>
+          ({
+            status: 200,
+            json: async () => ({
+              error: 0,
+              message: "Success",
+              data: templates,
+              metadata: { total: 300 },
+            }),
+          }) as unknown as Response,
+      );
       const { adapter } = build(fetchImpl);
 
       await expect(
         adapter.listTemplates({ offset: 5, limit: 20, status: "PENDING_REVIEW" }),
-      ).resolves.toEqual(templates);
+      ).resolves.toEqual({ templates, total: 300 });
       const { url, init } = lastCall(fetchImpl);
       expect(url.origin).toBe("https://business.openapi.zalo.me");
       expect(url.pathname).toBe("/template/all");
@@ -1762,6 +1809,11 @@ describe("ZaloOaAdapter", () => {
         status: "2",
       });
       expect((init.headers as Record<string, string>).access_token).toBe("acc_1");
+    });
+
+    it("falls back to the page length when Zalo reports no total", async () => {
+      const { adapter } = build(vi.fn(async () => ok([{ templateId: 1 }, { templateId: 2 }])));
+      await expect(adapter.listTemplates()).resolves.toMatchObject({ total: 2 });
     });
 
     it("lists the first hundred of every status by default", async () => {
@@ -1803,6 +1855,470 @@ describe("ZaloOaAdapter", () => {
       await adapter.listTemplates();
       expect(lastCall(fetchImpl).url.href).toBe(
         "https://proxy.example/template/all?offset=0&limit=100",
+      );
+    });
+  });
+
+  describe("read receipts", () => {
+    function seenEvent(overrides: Partial<ZaloOaWebhookEvent> = {}): ZaloOaWebhookEvent {
+      return userEvent({
+        event_name: "user_seen_message",
+        sender: { id: OA_ID },
+        recipient: { id: USER_ID },
+        message: { msg_ids: ["43b59c025aeabfb5e6fa", "m2"] },
+        timestamp: String(T0 + 5000),
+        ...overrides,
+      });
+    }
+
+    function withReceipt(onReadReceipt: ReturnType<typeof vi.fn>) {
+      const logger = { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() };
+      const adapter = new ZaloOaAdapter({
+        appId: APP_ID,
+        appSecret: "s",
+        oaSecretKey: OA_SECRET,
+        oaId: OA_ID,
+        accessToken: "a",
+        refreshToken: "r",
+        logger: logger as never,
+        onReadReceipt,
+      });
+      return { adapter, logger };
+    }
+
+    it("delivers who read which messages and when", async () => {
+      const onReadReceipt = vi.fn();
+      const { adapter } = withReceipt(onReadReceipt);
+      const event = seenEvent({ timestamp: String(Date.now() - 1000) });
+      const response = await adapter.handleWebhook(webhookRequest(event));
+
+      expect(response.status).toBe(200);
+      await vi.waitFor(() => expect(onReadReceipt).toHaveBeenCalledTimes(1));
+      expect(onReadReceipt).toHaveBeenCalledWith({
+        threadId: THREAD_ID,
+        userId: USER_ID,
+        messageIds: ["43b59c025aeabfb5e6fa", "m2"],
+        readAt: new Date(Number(event.timestamp)),
+        raw: event,
+      });
+    });
+
+    it("checks ownership against the sender, since the OA sent what was read", async () => {
+      const onReadReceipt = vi.fn();
+      const { adapter, logger } = withReceipt(onReadReceipt);
+      await adapter.handleWebhook(
+        webhookRequest(seenEvent({ sender: { id: "999" }, timestamp: String(Date.now()) })),
+      );
+      expect(onReadReceipt).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Ignoring a Zalo OA webhook for a different Official Account",
+        { event: "user_seen_message" },
+      );
+    });
+
+    it.each([
+      ["no message IDs", { message: { msg_ids: [] } }],
+      ["no user", { recipient: { id: "" } }],
+    ])("ignores a receipt with %s", async (_label, overrides) => {
+      const onReadReceipt = vi.fn();
+      const { adapter, logger } = withReceipt(onReadReceipt);
+      const event = seenEvent({ timestamp: String(Date.now()), ...overrides });
+      await adapter.handleWebhook(webhookRequest(event));
+      expect(onReadReceipt).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Ignoring a Zalo OA read receipt with no user, messages or time",
+        expect.anything(),
+      );
+    });
+
+    it("refuses to date a receipt from an implausible timestamp rather than from now", async () => {
+      // A receipt is a high-water mark: dating one "now" would mark messages
+      // sent after it as read. The stamp has to pass the signature's age
+      // check yet fail the plausibility floor, which only a clock set before
+      // 2010 allows.
+      vi.useFakeTimers({ now: 946_684_800_000 });
+      try {
+        const onReadReceipt = vi.fn();
+        const { adapter, logger } = withReceipt(onReadReceipt);
+        await adapter.handleWebhook(webhookRequest(seenEvent({ timestamp: "946684800000" })));
+        expect(onReadReceipt).not.toHaveBeenCalled();
+        expect(logger.warn).toHaveBeenCalledWith(
+          "Ignoring a Zalo OA read receipt with no user, messages or time",
+          expect.objectContaining({ timestamp: "946684800000" }),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("delivers a redelivered receipt once", async () => {
+      const onReadReceipt = vi.fn();
+      const { adapter } = withReceipt(onReadReceipt);
+      const event = seenEvent({ timestamp: String(Date.now() - 1000) });
+      await adapter.handleWebhook(webhookRequest(event));
+      await adapter.handleWebhook(webhookRequest(event));
+      await vi.waitFor(() => expect(onReadReceipt).toHaveBeenCalledTimes(1));
+    });
+
+    it("registers the handler with waitUntil so a serverless runtime keeps it alive", async () => {
+      let release: () => void = () => {};
+      const onReadReceipt = vi.fn(() => new Promise<void>((resolve) => (release = resolve)));
+      const { adapter } = withReceipt(onReadReceipt);
+      const waitUntil = vi.fn();
+
+      const response = await adapter.handleWebhook(
+        webhookRequest(seenEvent({ timestamp: String(Date.now()) })),
+        { waitUntil },
+      );
+
+      expect(response.status).toBe(200);
+      expect(waitUntil).toHaveBeenCalledTimes(1);
+      const [task] = waitUntil.mock.calls[0] as [Promise<unknown>];
+      let settled = false;
+      void task.then(() => (settled = true));
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      release();
+      await expect(task).resolves.toBeUndefined();
+    });
+
+    it("logs a failing handler and still answers 200", async () => {
+      const onReadReceipt = vi.fn(async () => {
+        throw new Error("db down");
+      });
+      const { adapter, logger } = withReceipt(onReadReceipt);
+      const response = await adapter.handleWebhook(
+        webhookRequest(seenEvent({ timestamp: String(Date.now()) })),
+      );
+      expect(response.status).toBe(200);
+      await vi.waitFor(() =>
+        expect(logger.error).toHaveBeenCalledWith("The onReadReceipt handler failed", {
+          error: expect.any(Error),
+          userId: USER_ID,
+        }),
+      );
+    });
+
+    it("notes a receipt nobody listens for at debug", async () => {
+      const { adapter, logger } = await initialized();
+      await adapter.handleWebhook(webhookRequest(seenEvent({ timestamp: String(Date.now()) })));
+      expect(logger.debug).toHaveBeenCalledWith(
+        "A Zalo OA read receipt arrived but no onReadReceipt is configured",
+        { userId: USER_ID },
+      );
+    });
+  });
+
+  describe("anonymous users", () => {
+    const ANON_ID = "1ffedc467f179649cf06";
+    const CONV_ID = "fa8f3f8701c2e89cb1d3";
+    const ANON_THREAD = `zalo-oa:${OA_ID}:anonymous:${ANON_ID}:${CONV_ID}`;
+
+    function anonEvent(overrides: Partial<ZaloOaWebhookEvent> = {}): ZaloOaWebhookEvent {
+      return userEvent({
+        event_name: "anonymous_send_text",
+        sender: { id: ANON_ID },
+        recipient: { id: OA_ID },
+        message: { conversation_id: CONV_ID, text: "hello", msg_id: "76eef2edcba822f67bb9" },
+        ...overrides,
+      });
+    }
+
+    it("files an anonymous message under a thread carrying both IDs", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(webhookRequest(anonEvent()));
+
+      expect(processed[0]?.threadId).toBe(ANON_THREAD);
+      expect(processed[0]?.message.author.userId).toBe(ANON_ID);
+      expect(processed[0]?.message.text).toBe("hello");
+      expect(adapter.isDM(ANON_THREAD)).toBe(true);
+      expect(processed[0]?.message.isMention).toBeUndefined();
+    });
+
+    it("refuses an anonymous message without a conversation", async () => {
+      const { adapter, processed, logger } = await initialized();
+      await adapter.handleWebhook(
+        webhookRequest(anonEvent({ message: { msg_id: "x", text: "y" } })),
+      );
+      expect(processed).toHaveLength(0);
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Ignoring a Zalo OA message with no ID, sender or conversation",
+        expect.objectContaining({ event: "anonymous_send_text" }),
+      );
+    });
+
+    it("ignores the OA's anonymous echoes", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(
+        webhookRequest(
+          anonEvent({
+            event_name: "oa_send_anonymous_text",
+            sender: { id: OA_ID },
+            recipient: { id: ANON_ID },
+          }),
+        ),
+      );
+      expect(processed).toHaveLength(0);
+    });
+
+    it("exposes an anonymous user's image and sticker as attachments", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(
+        webhookRequest(
+          anonEvent({
+            event_name: "anonymous_send_sticker",
+            message: {
+              conversation_id: CONV_ID,
+              msg_id: "s",
+              attachments: [{ type: "sticker", payload: { id: "0", url: "https://x/s" } }],
+            },
+          }),
+        ),
+      );
+      expect(processed[0]?.message.attachments[0]).toMatchObject({
+        type: "image",
+        url: "https://x/s",
+      });
+      expect(getStickerId(processed[0]?.message.raw)).toBe("0");
+    });
+
+    it("sends text to the anonymous endpoint with both IDs", async () => {
+      const fetchImpl = vi.fn(async () =>
+        ok({ message_id: "am1", anonymous_id: ANON_ID, conversation_id: CONV_ID }),
+      );
+      const { adapter } = build(fetchImpl);
+      const result = await adapter.postMessage(ANON_THREAD, "hi");
+
+      expect(result).toMatchObject({ id: "am1", threadId: ANON_THREAD });
+      const { url, body } = lastCall(fetchImpl);
+      expect(url.href).toBe("https://openapi.zalo.me/v2.0/oa/message");
+      expect(body).toEqual({
+        recipient: { anonymous_id: ANON_ID, conversation_id: CONV_ID },
+        message: { text: "hi" },
+      });
+    });
+
+    it("sends a file and a sticker to an anonymous user", async () => {
+      const fetchImpl = vi.fn(async (url: string) =>
+        url.includes("/upload/")
+          ? ok({ token: "tok" })
+          : ok({ message_id: "am", anonymous_id: ANON_ID, conversation_id: CONV_ID }),
+      );
+      const { adapter } = build(fetchImpl);
+      await adapter.postMessage(ANON_THREAD, {
+        raw: "",
+        files: [{ data: PDF, filename: "a.pdf" }],
+      });
+      expect(lastCall(fetchImpl).body).toEqual({
+        recipient: { anonymous_id: ANON_ID, conversation_id: CONV_ID },
+        message: { attachment: { type: "file", payload: { token: "tok" } } },
+      });
+      await adapter.sendSticker(ANON_THREAD, "st");
+      expect(lastCall(fetchImpl).body.recipient).toEqual({
+        anonymous_id: ANON_ID,
+        conversation_id: CONV_ID,
+      });
+    });
+
+    it("sends an image by URL to an anonymous user", async () => {
+      const fetchImpl = vi.fn(async () =>
+        ok({ message_id: "am", anonymous_id: ANON_ID, conversation_id: CONV_ID }),
+      );
+      const { adapter } = build(fetchImpl);
+      await adapter.sendImageUrl(ANON_THREAD, "https://cdn.example/a.jpg");
+      expect(lastCall(fetchImpl).body).toEqual({
+        recipient: { anonymous_id: ANON_ID, conversation_id: CONV_ID },
+        message: {
+          attachment: {
+            type: "template",
+            payload: {
+              template_type: "media",
+              elements: [{ media_type: "image", url: "https://cdn.example/a.jpg" }],
+            },
+          },
+        },
+      });
+    });
+
+    it("refuses an image for an anonymous user before uploading, since Zalo takes only a URL", async () => {
+      const fetchImpl = vi.fn();
+      const { adapter } = build(fetchImpl);
+      await expect(
+        adapter.postMessage(ANON_THREAD, { raw: "", files: [{ data: PNG, filename: "a.png" }] }),
+      ).rejects.toThrow(/only by URL/);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["history", (a: ZaloOaAdapter) => a.fetchMessages(ANON_THREAD)],
+      ["a quoted reply", (a: ZaloOaAdapter) => a.reply(ANON_THREAD, "m", "x")],
+      ["a reaction", (a: ZaloOaAdapter) => a.addReaction(ANON_THREAD, "m", "heart")],
+      ["a template", (a: ZaloOaAdapter) => a.sendTemplate(ANON_THREAD, "1", {})],
+    ])("refuses %s, which Zalo does not offer for anonymous users", async (_label, call) => {
+      const { adapter, fetchImpl } = build();
+      await expect(call(adapter)).rejects.toBeInstanceOf(NotImplementedError);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("parses an anonymous send result under its thread", () => {
+      const { adapter } = build();
+      expect(
+        adapter.parseMessage({ message_id: "s", anonymous_id: ANON_ID, conversation_id: CONV_ID })
+          .threadId,
+      ).toBe(ANON_THREAD);
+    });
+
+    it("describes an anonymous thread as a DM", async () => {
+      const { adapter } = build();
+      await expect(adapter.fetchThread(ANON_THREAD)).resolves.toMatchObject({ isDM: true });
+    });
+  });
+
+  describe("images by URL", () => {
+    it("sends with a caption one to one, and an empty caption to a group", async () => {
+      const fetchImpl = vi.fn(async () => ok({ message_id: "m", user_id: USER_ID }));
+      const { adapter } = build(fetchImpl);
+
+      await adapter.sendImageUrl(THREAD_ID, "https://x/a.png", "Look");
+      expect(lastCall(fetchImpl).url.pathname).toBe("/v3.0/oa/message/cs");
+      expect(lastCall(fetchImpl).body.message).toEqual({
+        text: "Look",
+        attachment: {
+          type: "template",
+          payload: {
+            template_type: "media",
+            elements: [{ media_type: "image", url: "https://x/a.png" }],
+          },
+        },
+      });
+
+      await adapter.sendImageUrl(THREAD_ID, "https://x/a.png");
+      expect(lastCall(fetchImpl).body.message).not.toHaveProperty("text");
+
+      await adapter.sendImageUrl(`zalo-oa:${OA_ID}:group:abc`, "https://x/a.png");
+      expect(lastCall(fetchImpl).url.pathname).toBe("/v3.0/oa/group/message");
+      expect(lastCall(fetchImpl).body.message.text).toBe("");
+    });
+
+    it.each(["ftp://x/a.png", "data:image/png;base64,AA==", "", "x/a.png"])(
+      "refuses the URL %j",
+      async (url) => {
+        const { adapter, fetchImpl } = build();
+        await expect(adapter.sendImageUrl(THREAD_ID, url)).rejects.toBeInstanceOf(ValidationError);
+        expect(fetchImpl).not.toHaveBeenCalled();
+      },
+    );
+
+    it("refuses an over-long caption", async () => {
+      const { adapter, fetchImpl } = build();
+      await expect(
+        adapter.sendImageUrl(THREAD_ID, "https://x/a.png", "a".repeat(2001)),
+      ).rejects.toThrow(/caption is 2001/);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("templates by phone", () => {
+    const receipt = {
+      msg_id: "a4d0243feee163bd3af2",
+      sent_time: String(T0),
+      sending_mode: "1",
+      quota: { dailyQuota: "500", remainingQuota: "499" },
+    };
+
+    it("sends to the business host with a generated tracking ID", async () => {
+      const fetchImpl = vi.fn(async () => ok(receipt));
+      const { adapter } = build(fetchImpl);
+      const result = await adapter.sendTemplateByPhone("+84 987 654 321", 7895417, { ky: "1" });
+
+      const { url, body } = lastCall(fetchImpl);
+      expect(url.href).toBe("https://business.openapi.zalo.me/message/template");
+      expect(body).toMatchObject({
+        phone: "84987654321",
+        template_id: "7895417",
+        template_data: { ky: "1" },
+      });
+      expect(body.tracking_id).toMatch(/^[0-9a-f]{32}$/);
+      expect(body).not.toHaveProperty("sending_mode");
+      expect(result).toEqual({
+        messageId: "a4d0243feee163bd3af2",
+        trackingId: body.tracking_id,
+        sentAt: new Date(T0),
+        remainingDailyQuota: 499,
+        raw: receipt,
+      });
+    });
+
+    it("forwards a tracking ID and the over-quota mode", async () => {
+      const fetchImpl = vi.fn(async () => ok({ msg_id: "m" }));
+      const { adapter } = build(fetchImpl);
+      const result = await adapter.sendTemplateByPhone(
+        "84987654321",
+        "t",
+        {},
+        {
+          trackingId: "order-42",
+          sendingMode: 3,
+        },
+      );
+      expect(lastCall(fetchImpl).body).toMatchObject({
+        tracking_id: "order-42",
+        sending_mode: "3",
+      });
+      expect(result).toMatchObject({
+        trackingId: "order-42",
+        sentAt: undefined,
+        remainingDailyQuota: undefined,
+      });
+    });
+
+    it("refuses a sending mode Zalo does not define before sending", async () => {
+      const { adapter, fetchImpl } = build();
+      await expect(
+        adapter.sendTemplateByPhone("84987654321", "t", {}, { sendingMode: 2 as never }),
+      ).rejects.toBeInstanceOf(ValidationError);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["a local number", "0987654321"],
+      ["letters", "84abc"],
+      ["an empty number", ""],
+      ["a too-long number", "8498765432198765"],
+    ])("refuses %s before sending", async (_label, phone) => {
+      const { adapter, fetchImpl } = build();
+      await expect(adapter.sendTemplateByPhone(phone, "t", {})).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it.each(["", "a".repeat(49), "has space", "x/y"])(
+      "refuses the tracking ID %j",
+      async (trackingId) => {
+        const { adapter, fetchImpl } = build();
+        await expect(
+          adapter.sendTemplateByPhone("84987654321", "t", {}, { trackingId }),
+        ).rejects.toBeInstanceOf(ValidationError);
+        expect(fetchImpl).not.toHaveBeenCalled();
+      },
+    );
+
+    it("refuses an empty template ID and non-object data", async () => {
+      const { adapter, fetchImpl } = build();
+      await expect(adapter.sendTemplateByPhone("84987654321", " ", {})).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+      await expect(
+        adapter.sendTemplateByPhone("84987654321", "t", [] as never),
+      ).rejects.toBeInstanceOf(ValidationError);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("treats a receipt without msg_id as unconfirmed", async () => {
+      const { adapter } = build(vi.fn(async () => ok({ sent_time: "1" })));
+      await expect(adapter.sendTemplateByPhone("84987654321", "t", {})).rejects.toBeInstanceOf(
+        NetworkError,
       );
     });
   });
