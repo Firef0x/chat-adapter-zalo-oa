@@ -46,6 +46,9 @@ import type {
   ZaloOaOutboundMessage,
   ZaloOaRawMessage,
   ZaloOaSendMessageData,
+  ZaloOaTemplateData,
+  ZaloOaTemplateStatus,
+  ZaloOaTemplateSummary,
   ZaloOaThreadId,
   ZaloOaUserDetail,
   ZaloOaWebhookAttachment,
@@ -68,8 +71,18 @@ function idOf(value: unknown): string {
   return typeof value === "string" || typeof value === "number" ? String(value) : "";
 }
 
-/** The history endpoint returns at most this many messages per request. */
+/** The one-to-one history endpoint returns at most this many messages per request. */
 const HISTORY_PAGE_SIZE = 10;
+
+/**
+ * Page size for group history.
+ *
+ * Zalo documents a default of five and no maximum. Asking for more risks a
+ * page silently capped below the request, which the pager would read as the
+ * end of the history and stop with older messages still unread. Five is the
+ * one size Zalo is known to serve in full.
+ */
+const GROUP_HISTORY_PAGE_SIZE = 5;
 
 const REQUIRED_CREDENTIALS = [
   "appId",
@@ -98,10 +111,32 @@ function parseTimestamp(value: unknown): number | undefined {
   return parsed;
 }
 
-/** One-to-one user message events. Group events carry `_group_` and are not handled yet. */
-function isUserMessageEvent(eventName: string): boolean {
-  return eventName.startsWith("user_send_") && !eventName.startsWith("user_send_group_");
+/** A user's message in a GMF group chat. */
+function isGroupMessageEvent(eventName: string): boolean {
+  return eventName.startsWith("user_send_group_");
 }
+
+/** A user's message to the OA, one to one. */
+function isUserMessageEvent(eventName: string): boolean {
+  return eventName.startsWith("user_send_") && !isGroupMessageEvent(eventName);
+}
+
+/** Group events name the message `message_id` in their field table and `msg_id` in their example. */
+function messageIdOf(message: ZaloOaWebhookEvent["message"]): string {
+  return idOf(message?.msg_id) || idOf(message?.message_id);
+}
+
+export const ZALO_BUSINESS_API_HOST = "https://business.openapi.zalo.me";
+
+/** The ZBS list endpoint returns at most this many templates per request. */
+const TEMPLATE_PAGE_LIMIT = 100;
+
+const TEMPLATE_STATUS_CODES: Readonly<Record<ZaloOaTemplateStatus, number>> = {
+  ENABLE: 1,
+  PENDING_REVIEW: 2,
+  REJECT: 3,
+  DISABLE: 4,
+};
 
 /** Webhook attachment types that map onto a Chat SDK attachment. */
 const ATTACHMENT_KINDS: Readonly<Record<string, Attachment["type"]>> = {
@@ -232,17 +267,33 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     return this.encodeThreadId({ oaId: this.config.oaId, type: "user", id: userId });
   }
 
-  /** Decode a thread and insist it is a one-to-one conversation of this OA. */
-  private userIdOf(threadId: string): string {
-    const { oaId, type, id } = this.decodeThreadId(threadId);
-    if (oaId !== this.config.oaId) {
+  private groupThreadId(groupId: string): string {
+    return this.encodeThreadId({ oaId: this.config.oaId, type: "group", id: groupId });
+  }
+
+  /** Decode a thread and insist it belongs to this OA. */
+  private targetOf(threadId: string): ZaloOaThreadId {
+    const target = this.decodeThreadId(threadId);
+    if (target.oaId !== this.config.oaId) {
       throw new ValidationError(
         ADAPTER_NAME,
         `This adapter is connected to a different Official Account than ${threadId}.`,
       );
     }
+    return target;
+  }
+
+  /**
+   * Decode a thread and insist it is a one-to-one conversation of this OA,
+   * for the operations Zalo offers only towards a single user.
+   */
+  private userIdOf(threadId: string, operation: string): string {
+    const { type, id } = this.targetOf(threadId);
     if (type !== "user") {
-      throw new NotImplementedError("Zalo OA group chats are not supported yet", ADAPTER_NAME);
+      throw new NotImplementedError(
+        `Zalo offers ${operation} only in one-to-one conversations, not in group chats`,
+        ADAPTER_NAME,
+      );
     }
     return id;
   }
@@ -319,8 +370,8 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
   private processEvent(event: ZaloOaWebhookEvent, options?: WebhookOptions): void {
     const eventName = typeof event.event_name === "string" ? event.event_name : "";
 
-    if (isUserMessageEvent(eventName)) {
-      this.dispatchUserMessage(event, options);
+    if (isUserMessageEvent(eventName) || isGroupMessageEvent(eventName)) {
+      this.dispatchMessage(event, options);
       return;
     }
 
@@ -340,26 +391,43 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     this.logger.debug("Ignoring Zalo OA event", { event: eventName });
   }
 
-  private dispatchUserMessage(event: ZaloOaWebhookEvent, options?: WebhookOptions): void {
+  /**
+   * The OA an event belongs to.
+   *
+   * A one-to-one message is addressed to the OA. A group message is
+   * addressed to the group and names the OA in `oa_id` instead — so reading
+   * the recipient for both would file every group message under another
+   * account.
+   */
+  private ownerOf(event: ZaloOaWebhookEvent): string {
+    return isGroupMessageEvent(event.event_name) ? idOf(event.oa_id) : idOf(event.recipient?.id);
+  }
+
+  private dispatchMessage(event: ZaloOaWebhookEvent, options?: WebhookOptions): void {
     // One app can be linked to several OAs and receives all of their events,
     // so an event for a different OA must not be handled with these tokens.
-    if (idOf(event.recipient?.id) !== this.config.oaId) {
+    // An event naming no OA at all is refused too: failing open here would
+    // hand another account's messages to this one.
+    if (this.ownerOf(event) !== this.config.oaId) {
       this.logger.warn("Ignoring a Zalo OA webhook for a different Official Account", {
         event: event.event_name,
       });
       return;
     }
 
-    const messageId = idOf(event.message?.msg_id);
+    const group = isGroupMessageEvent(event.event_name);
+    const messageId = messageIdOf(event.message);
     const userId = idOf(event.sender?.id);
-    // Both are documented as always present, so an absence means the payload
+    const groupId = group ? idOf(event.recipient?.id) : "";
+    // All are documented as always present, so an absence means the payload
     // shape changed — worth more than a debug line, since every inbound
     // message would otherwise vanish without a trace in production.
-    if (!messageId || !userId) {
+    if (!messageId || !userId || (group && !groupId)) {
       this.logger.warn("Ignoring a Zalo OA message with no ID or sender", {
         event: event.event_name,
         messageId,
         userId,
+        ...(group ? { groupId } : {}),
       });
       return;
     }
@@ -387,7 +455,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     // Not awaited: see handleWebhook. The SDK attaches its own error handler
     // to this promise and logs a failing handler, and registers it with
     // `waitUntil` when one is given.
-    void this.chat.processMessage(this, this.userThreadId(userId), message, options);
+    void this.chat.processMessage(this, message.threadId, message, options);
   }
 
   /**
@@ -405,7 +473,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
       return;
     }
 
-    const messageId = idOf(event.message?.msg_id);
+    const messageId = messageIdOf(event.message);
     const userId = idOf(event.sender?.id);
     const icon = typeof event.message?.react_icon === "string" ? event.message.react_icon : "";
     if (!messageId || !userId || !icon) {
@@ -467,13 +535,19 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     const content = event.message ?? {};
     const userId = idOf(event.sender?.id);
     const text = content.text || this.describeAttachments(content.attachments);
+    const group = isGroupMessageEvent(event.event_name);
 
     return new Message<ZaloOaRawMessage>({
-      id: idOf(content.msg_id),
-      threadId: this.userThreadId(userId),
+      id: messageIdOf(content),
+      threadId: group ? this.groupThreadId(idOf(event.recipient?.id)) : this.userThreadId(userId),
       text,
       formatted: this.converter.toAst(text),
       raw: event,
+      // Zalo writes a mention as `[@id]`. Only one naming this OA counts:
+      // `[@group_id]` addresses everyone, and answering every such broadcast
+      // would make the bot reply to announcements. Left unset in one-to-one
+      // conversations, where every message is addressed to the bot anyway.
+      ...(group ? { isMention: text.includes(`[@${this.config.oaId}]`) } : {}),
       author: {
         // The webhook carries no display name. Hosts that need one can call
         // getUser(), which costs a request — so it is not done per message.
@@ -535,29 +609,36 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
   }
 
   /**
-   * Convert an entry from the history endpoint.
+   * Convert an entry from a history endpoint.
    *
    * The history and webhook representations are different shapes, so this
    * cannot reuse the webhook path.
    *
-   * `userId` is passed in by `fetchMessages`, which already knows whose
-   * conversation it read. Deriving it from the entry is a last resort: Zalo
-   * documents `from_id` and `to_id` as `long`, and an 18-digit ID sent as a
-   * JSON number has already lost precision by the time it is parsed — it
-   * would decode to a plausible, different user.
+   * `known` is the thread `fetchMessages` read, which it passes in. Deriving
+   * the thread from the entry is a last resort: Zalo documents the one-to-one
+   * `from_id` and `to_id` as `long`, and an 18-digit ID sent as a JSON number
+   * has already lost precision by the time it is parsed — it would decode to
+   * a plausible, different user.
    */
   private parseHistoryMessage(
     entry: ZaloOaHistoryMessage,
     fallbackMs = Date.now(),
-    knownUserId?: string,
+    known?: Pick<ZaloOaThreadId, "type" | "id">,
   ): Message<ZaloOaRawMessage> {
     // Compared by value: `src` is documented as an int, but a string "1"
     // read strictly would file every user message as the OA's own.
     const fromUser = Number(entry.src) === 1;
-    const userId = knownUserId ?? idOf(fromUser ? entry.from_id : entry.to_id);
-    if (!userId) {
-      throw new ValidationError(ADAPTER_NAME, "A Zalo OA history entry names no user.");
+    const thread =
+      known ??
+      (entry.group_id
+        ? { type: "group" as const, id: idOf(entry.group_id) }
+        : { type: "user" as const, id: idOf(fromUser ? entry.from_id : entry.to_id) });
+    if (!thread.id) {
+      throw new ValidationError(ADAPTER_NAME, "A Zalo OA history entry names no conversation.");
     }
+    // In a group the sender is one member among many, so it is read from the
+    // entry; in a one-to-one thread it can only be the thread's user.
+    const userId = thread.type === "group" ? idOf(entry.from_id) : thread.id;
     const kind = lookup(HISTORY_ATTACHMENT_KINDS, String(entry.type));
     const url = entry.url;
     const text =
@@ -584,7 +665,8 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
 
     return new Message<ZaloOaRawMessage>({
       id: entry.message_id,
-      threadId: this.userThreadId(userId),
+      threadId:
+        thread.type === "group" ? this.groupThreadId(thread.id) : this.userThreadId(thread.id),
       text,
       formatted: this.converter.toAst(text),
       raw: entry,
@@ -610,7 +692,9 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
   private parseSentMessage(data: ZaloOaSendMessageData): Message<ZaloOaRawMessage> {
     return new Message<ZaloOaRawMessage>({
       id: data.message_id,
-      threadId: this.userThreadId(data.user_id),
+      threadId: data.group_id
+        ? this.groupThreadId(idOf(data.group_id))
+        : this.userThreadId(idOf(data.user_id)),
       text: "",
       formatted: this.converter.toAst(""),
       raw: data,
@@ -717,21 +801,24 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     threadId: string,
     message: AdapterPostableMessage,
   ): Promise<RawMessage<ZaloOaRawMessage>> {
-    const userId = this.userIdOf(threadId);
+    const target = this.targetOf(threadId);
     const files = extractFiles(message);
     if (files.length === 0) {
-      return this.send(threadId, userId, { text: this.renderSendableText(message) });
+      return this.send(threadId, target, { text: this.renderSendableText(message) });
     }
-    return this.sendMedia(threadId, userId, message, files);
+    return this.sendMedia(threadId, target, message, files);
   }
 
-  /** Reply to a specific message, which Zalo shows as a quote. Text only. */
+  /**
+   * Reply to a specific message, which Zalo shows as a quote. Text only, and
+   * one to one only: Zalo's group API has no quoted reply.
+   */
   async reply(
     threadId: string,
     messageId: string,
     message: AdapterPostableMessage,
   ): Promise<RawMessage<ZaloOaRawMessage>> {
-    const userId = this.userIdOf(threadId);
+    const userId = this.userIdOf(threadId, "quoted replies");
     if (!messageId) {
       throw new ValidationError(ADAPTER_NAME, "A message ID is required to quote a message.");
     }
@@ -741,10 +828,11 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
         "Zalo quotes only text. Send the attachment as its own message.",
       );
     }
-    return this.send(threadId, userId, {
-      text: this.renderSendableText(message),
-      quote_message_id: messageId,
-    });
+    return this.send(
+      threadId,
+      { type: "user", id: userId },
+      { text: this.renderSendableText(message), quote_message_id: messageId },
+    );
   }
 
   /**
@@ -776,7 +864,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
    */
   private async sendMedia(
     threadId: string,
-    userId: string,
+    target: Pick<ZaloOaThreadId, "type" | "id">,
     message: AdapterPostableMessage,
     files: FileUpload[],
   ): Promise<RawMessage<ZaloOaRawMessage>> {
@@ -812,11 +900,13 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     const id = await uploadMedia(this.api, media);
 
     if (media.kind === "file") {
-      return this.send(threadId, userId, { attachment: { type: "file", payload: { token: id } } });
+      return this.send(threadId, target, { attachment: { type: "file", payload: { token: id } } });
     }
 
-    return this.send(threadId, userId, {
-      ...(hasCaption ? { text: caption } : {}),
+    return this.send(threadId, target, {
+      // Optional one to one, but required by the group API, which is sent an
+      // empty caption rather than refusing an image that has none.
+      ...(hasCaption ? { text: caption } : target.type === "group" ? { text: "" } : {}),
       attachment: {
         type: "template",
         payload: {
@@ -839,11 +929,11 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
    * sticker a user sent, via {@link getStickerId}.
    */
   async sendSticker(threadId: string, stickerId: string): Promise<RawMessage<ZaloOaRawMessage>> {
-    const userId = this.userIdOf(threadId);
+    const target = this.targetOf(threadId);
     if (!stickerId.trim()) {
       throw new ValidationError(ADAPTER_NAME, "A sticker ID is required to send a sticker.");
     }
-    return this.send(threadId, userId, {
+    return this.send(threadId, target, {
       attachment: {
         type: "template",
         payload: {
@@ -856,15 +946,26 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
 
   private async send(
     threadId: string,
-    userId: string,
+    target: Pick<ZaloOaThreadId, "type" | "id">,
     message: ZaloOaOutboundMessage,
   ): Promise<RawMessage<ZaloOaRawMessage>> {
-    const data = await this.api.request<ZaloOaSendMessageData>({
-      method: "POST",
-      path: "v3.0/oa/message/cs",
-      body: { recipient: { user_id: userId }, message },
-    });
+    const data = await this.api.request<ZaloOaSendMessageData>(
+      target.type === "group"
+        ? {
+            method: "POST",
+            path: "v3.0/oa/group/message",
+            body: { recipient: { group_id: target.id }, message },
+          }
+        : {
+            method: "POST",
+            path: "v3.0/oa/message/cs",
+            body: { recipient: { user_id: target.id }, message },
+          },
+    );
+    return this.sentMessage(threadId, data);
+  }
 
+  private sentMessage(threadId: string, data: ZaloOaSendMessageData): RawMessage<ZaloOaRawMessage> {
     if (!data?.message_id) {
       // Success with no ID means delivery is unconfirmed, and the host has
       // nothing to quote, edit, or correlate with a later read receipt.
@@ -875,6 +976,77 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     }
 
     return { id: data.message_id, raw: data, threadId };
+  }
+
+  /**
+   * Send a ZBS template message.
+   *
+   * The template is registered and approved at Zalo in advance; a send only
+   * names it and fills in its parameters. Unlike a consultation message it
+   * reaches a user outside the seven-day interaction window, which is what it
+   * is for — and unlike one, it is charged per message. Zalo sends templates
+   * by user only, so a group thread is refused.
+   */
+  async sendTemplate(
+    threadId: string,
+    templateId: string,
+    data: ZaloOaTemplateData,
+  ): Promise<RawMessage<ZaloOaRawMessage>> {
+    const userId = this.userIdOf(threadId, "template messages");
+    const id = String(templateId ?? "").trim();
+    if (!id) {
+      throw new ValidationError(ADAPTER_NAME, "A template ID is required to send a template.");
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      throw new ValidationError(
+        ADAPTER_NAME,
+        "Template data must be an object of parameter values.",
+      );
+    }
+
+    const sent = await this.api.request<ZaloOaSendMessageData>({
+      method: "POST",
+      path: "v3.0/oa/message/template",
+      body: { user_id: userId, template_id: id, template_data: data },
+    });
+    return this.sentMessage(threadId, sent);
+  }
+
+  /**
+   * List the OA's ZBS templates, newest first.
+   *
+   * Requires the "manage message templates" permission.
+   */
+  async listTemplates(options?: {
+    offset?: number;
+    /** At most 100, which is also the default. */
+    limit?: number;
+    status?: ZaloOaTemplateStatus;
+  }): Promise<ZaloOaTemplateSummary[]> {
+    const offset = Math.trunc(options?.offset ?? 0);
+    const limit = Math.trunc(options?.limit ?? TEMPLATE_PAGE_LIMIT);
+    if (!Number.isFinite(offset) || offset < 0) {
+      throw new ValidationError(ADAPTER_NAME, `Invalid template offset: ${options?.offset}`);
+    }
+    if (!Number.isFinite(limit) || limit < 1 || limit > TEMPLATE_PAGE_LIMIT) {
+      throw new ValidationError(
+        ADAPTER_NAME,
+        `Template limit must be between 1 and ${TEMPLATE_PAGE_LIMIT}; got ${options?.limit}.`,
+      );
+    }
+    const status = options?.status;
+    const statusCode = status === undefined ? undefined : lookup(TEMPLATE_STATUS_CODES, status);
+    if (status !== undefined && statusCode === undefined) {
+      throw new ValidationError(ADAPTER_NAME, `Unknown template status: ${status}`);
+    }
+
+    const page = await this.api.request<ZaloOaTemplateSummary[]>({
+      method: "GET",
+      baseUrl: this.config.businessApiBaseUrl ?? ZALO_BUSINESS_API_HOST,
+      path: "template/all",
+      query: { offset, limit, status: statusCode },
+    });
+    return Array.isArray(page) ? page : [];
   }
 
   /** Zalo OA has no typing indicator, so this does nothing. */
@@ -895,7 +1067,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     threadId: string,
     options?: FetchOptions,
   ): Promise<FetchResult<ZaloOaRawMessage>> {
-    const userId = this.userIdOf(threadId);
+    const target = this.targetOf(threadId);
 
     if (options?.direction === "forward") {
       throw new NotImplementedError(
@@ -927,19 +1099,30 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
       return { messages: [], nextCursor: options?.cursor };
     }
 
+    const pageSize = target.type === "group" ? GROUP_HISTORY_PAGE_SIZE : HISTORY_PAGE_SIZE;
     const entries: ZaloOaHistoryMessage[] = [];
     let offset = start;
     let exhausted = false;
 
     while (entries.length < limit) {
-      const count = Math.min(HISTORY_PAGE_SIZE, limit - entries.length);
+      const count = Math.min(pageSize, limit - entries.length);
       // Sequential by definition: each page starts where the last ended.
       // oxlint-disable-next-line no-await-in-loop
-      const page = await this.api.request<ZaloOaHistoryMessage[]>({
-        method: "GET",
-        path: "v2.0/oa/conversation",
-        query: { data: JSON.stringify({ user_id: userId, offset, count }) },
-      });
+      // The two endpoints take their parameters differently: one-to-one
+      // history wants a JSON `data` parameter, group history plain ones.
+      const page = await this.api.request<ZaloOaHistoryMessage[]>(
+        target.type === "group"
+          ? {
+              method: "GET",
+              path: "v3.0/oa/group/conversation",
+              query: { group_id: target.id, offset, count },
+            }
+          : {
+              method: "GET",
+              path: "v2.0/oa/conversation",
+              query: { data: JSON.stringify({ user_id: target.id, offset, count }) },
+            },
+      );
 
       const items = Array.isArray(page) ? page : [];
       entries.push(...items);
@@ -958,7 +1141,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
     for (const entry of entries) {
       // Per entry: one unreadable entry should not discard the page.
       try {
-        const parsed = this.parseHistoryMessage(entry, lastKnownMs, userId);
+        const parsed = this.parseHistoryMessage(entry, lastKnownMs, target);
         lastKnownMs = parsed.metadata.dateSent.getTime();
         messages.push(parsed);
       } catch (error) {
@@ -1082,7 +1265,7 @@ export class ZaloOaAdapter implements Adapter<ZaloOaThreadId, ZaloOaRawMessage> 
   }
 
   private async react(threadId: string, messageId: string, icon: string): Promise<void> {
-    const userId = this.userIdOf(threadId);
+    const userId = this.userIdOf(threadId, "reactions");
     if (!messageId) {
       throw new ValidationError(ADAPTER_NAME, "A message ID is required to react to a message.");
     }

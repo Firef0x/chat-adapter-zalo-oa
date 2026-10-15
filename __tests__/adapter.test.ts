@@ -469,23 +469,6 @@ describe("ZaloOaAdapter", () => {
       expect(processed).toHaveLength(0);
     });
 
-    it("ignores group messages until groups are supported", async () => {
-      const { adapter, processed, logger } = await initialized();
-      // A group event's recipient is the group. Routed down the one-to-one
-      // path it would trip the OA ownership check and be misreported as
-      // traffic for another account.
-      await adapter.handleWebhook(
-        webhookRequest(
-          userEvent({ event_name: "user_send_group_text", recipient: { id: "f414c8f7" } }),
-        ),
-      );
-      expect(processed).toHaveLength(0);
-      expect(logger.warn).not.toHaveBeenCalled();
-      expect(logger.debug).toHaveBeenCalledWith("Ignoring Zalo OA event", {
-        event: "user_send_group_text",
-      });
-    });
-
     it("ignores other events", async () => {
       const { adapter, processed } = await initialized();
       const response = await adapter.handleWebhook(
@@ -610,12 +593,6 @@ describe("ZaloOaAdapter", () => {
       await expect(adapter.postMessage(THREAD_ID, "a".repeat(2000))).resolves.toBeDefined();
       await expect(adapter.postMessage(THREAD_ID, "a".repeat(2001))).rejects.toThrow(
         /at most 2000/,
-      );
-    });
-
-    it("refuses a group thread", async () => {
-      await expect(adapter.postMessage(`zalo-oa:${OA_ID}:group:abc`, "hi")).rejects.toBeInstanceOf(
-        NotImplementedError,
       );
     });
 
@@ -1141,13 +1118,6 @@ describe("ZaloOaAdapter", () => {
       await expect(adapter.sendSticker(THREAD_ID, "  ")).rejects.toBeInstanceOf(ValidationError);
       expect(fetchImpl).not.toHaveBeenCalled();
     });
-
-    it("refuses a sticker for a group thread", async () => {
-      const { adapter } = build();
-      await expect(adapter.sendSticker(`zalo-oa:${OA_ID}:group:abc`, "s")).rejects.toBeInstanceOf(
-        NotImplementedError,
-      );
-    });
   });
 
   describe("reactions", () => {
@@ -1380,6 +1350,367 @@ describe("ZaloOaAdapter", () => {
           to_id: OA_ID,
         }),
       ).toBeUndefined();
+    });
+  });
+
+  describe("group chats", () => {
+    const GROUP_ID = "f414c8f76fa586fbdfb4";
+    const GROUP_THREAD = `zalo-oa:${OA_ID}:group:${GROUP_ID}`;
+
+    function groupEvent(overrides: Partial<ZaloOaWebhookEvent> = {}): ZaloOaWebhookEvent {
+      return userEvent({
+        event_name: "user_send_group_text",
+        sender: { id: "8756287263669629130" },
+        recipient: { id: GROUP_ID },
+        oa_id: OA_ID,
+        message: { msg_id: "g1", text: "Hello group from User" },
+        ...overrides,
+      });
+    }
+
+    it("dispatches a group message to the group's thread", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(webhookRequest(groupEvent()));
+
+      expect(processed).toHaveLength(1);
+      const { threadId, message } = processed[0] as (typeof processed)[number];
+      expect(threadId).toBe(GROUP_THREAD);
+      expect(message.threadId).toBe(GROUP_THREAD);
+      expect(message.author.userId).toBe("8756287263669629130");
+      expect(message.text).toBe("Hello group from User");
+      expect(adapter.isDM(threadId)).toBe(false);
+    });
+
+    it("checks ownership against oa_id, since the recipient is the group", async () => {
+      const { adapter, processed, logger } = await initialized();
+      await adapter.handleWebhook(webhookRequest(groupEvent({ oa_id: "999" })));
+      expect(processed).toHaveLength(0);
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Ignoring a Zalo OA webhook for a different Official Account",
+        { event: "user_send_group_text" },
+      );
+    });
+
+    it("refuses a group event that names no OA", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(webhookRequest(groupEvent({ oa_id: undefined })));
+      expect(processed).toHaveLength(0);
+    });
+
+    it("accepts the message ID under message_id, as the field table names it", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(
+        webhookRequest(groupEvent({ message: { message_id: "g2", text: "hi" } })),
+      );
+      expect(processed[0]?.message.id).toBe("g2");
+    });
+
+    it("refuses a group event with no group", async () => {
+      const { adapter, processed, logger } = await initialized();
+      await adapter.handleWebhook(webhookRequest(groupEvent({ recipient: { id: "" } })));
+      expect(processed).toHaveLength(0);
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Ignoring a Zalo OA message with no ID or sender",
+        expect.objectContaining({ groupId: "" }),
+      );
+    });
+
+    it("marks a message that mentions the OA, and only that", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(
+        webhookRequest(groupEvent({ message: { msg_id: "a", text: `hi [@${OA_ID}]` } })),
+      );
+      await adapter.handleWebhook(
+        webhookRequest(groupEvent({ message: { msg_id: "b", text: `all [@${GROUP_ID}]` } })),
+      );
+      await adapter.handleWebhook(
+        webhookRequest(groupEvent({ message: { msg_id: "c", text: "plain" } })),
+      );
+      expect(processed.map((entry) => entry.message.isMention)).toEqual([true, false, false]);
+    });
+
+    it("leaves isMention to the SDK in one-to-one conversations", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(webhookRequest(userEvent()));
+      expect(processed[0]?.message.isMention).toBeUndefined();
+    });
+
+    it("ignores the OA's own group echoes", async () => {
+      const { adapter, processed } = await initialized();
+      await adapter.handleWebhook(
+        webhookRequest(groupEvent({ event_name: "oa_send_group_text", sender: { id: OA_ID } })),
+      );
+      expect(processed).toHaveLength(0);
+    });
+
+    it("posts text to the group endpoint", async () => {
+      const fetchImpl = vi.fn(async () => ok({ message_id: "gm1", group_id: GROUP_ID }));
+      const { adapter } = build(fetchImpl);
+      const result = await adapter.postMessage(GROUP_THREAD, `hello [@${USER_ID}]`);
+
+      expect(result).toMatchObject({ id: "gm1", threadId: GROUP_THREAD });
+      const { url, body } = lastCall(fetchImpl);
+      expect(url.href).toBe("https://openapi.zalo.me/v3.0/oa/group/message");
+      expect(body).toEqual({
+        recipient: { group_id: GROUP_ID },
+        message: { text: `hello [@${USER_ID}]` },
+      });
+    });
+
+    it("sends a group image with an empty caption, which the group API requires", async () => {
+      const fetchImpl = vi.fn(async (url: string) =>
+        url.includes("/upload/")
+          ? ok({ attachment_id: "att" })
+          : ok({ message_id: "gm", group_id: GROUP_ID }),
+      );
+      const { adapter } = build(fetchImpl);
+      await adapter.postMessage(GROUP_THREAD, {
+        raw: "",
+        files: [{ data: PNG, filename: "a.png" }],
+      });
+
+      const { url, body } = lastCall(fetchImpl);
+      expect(url.pathname).toBe("/v3.0/oa/group/message");
+      expect(body.message.text).toBe("");
+      expect(body.message.attachment.payload.elements).toEqual([
+        { media_type: "image", attachment_id: "att" },
+      ]);
+    });
+
+    it("sends a group file and a group sticker", async () => {
+      const fetchImpl = vi.fn(async (url: string) =>
+        url.includes("/upload/")
+          ? ok({ token: "tok" })
+          : ok({ message_id: "gm", group_id: GROUP_ID }),
+      );
+      const { adapter } = build(fetchImpl);
+      await adapter.postMessage(GROUP_THREAD, {
+        raw: "",
+        files: [{ data: PDF, filename: "a.pdf" }],
+      });
+      expect(lastCall(fetchImpl).body).toEqual({
+        recipient: { group_id: GROUP_ID },
+        message: { attachment: { type: "file", payload: { token: "tok" } } },
+      });
+
+      await adapter.sendSticker(GROUP_THREAD, "st1");
+      expect(lastCall(fetchImpl).body.recipient).toEqual({ group_id: GROUP_ID });
+    });
+
+    it.each([
+      ["a quoted reply", (a: ZaloOaAdapter) => a.reply(GROUP_THREAD, "m", "x")],
+      ["a reaction", (a: ZaloOaAdapter) => a.addReaction(GROUP_THREAD, "m", "heart")],
+      ["a template", (a: ZaloOaAdapter) => a.sendTemplate(GROUP_THREAD, "1", {})],
+    ])("refuses %s, which Zalo offers one to one only", async (_label, call) => {
+      const { adapter, fetchImpl } = build();
+      await expect(call(adapter)).rejects.toBeInstanceOf(NotImplementedError);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("reads group history with plain parameters and attributes each sender", async () => {
+      const fetchImpl = vi.fn(async () =>
+        ok([
+          {
+            src: 0,
+            time: T0 + 1000,
+            type: "text",
+            message: "m4",
+            message_id: "oa_msg",
+            from_id: OA_ID,
+            group_id: GROUP_ID,
+          },
+          {
+            src: 1,
+            time: T0,
+            type: "photo",
+            url: "https://x/p.jpg",
+            message_id: "user_msg",
+            from_id: "8756287263669629130",
+            from_display_name: "Phuoc",
+            group_id: GROUP_ID,
+          },
+        ]),
+      );
+      const { adapter } = build(fetchImpl);
+      const { messages, nextCursor } = await adapter.fetchMessages(GROUP_THREAD, { limit: 2 });
+
+      const { url } = lastCall(fetchImpl);
+      expect(url.pathname).toBe("/v3.0/oa/group/conversation");
+      expect(Object.fromEntries(url.searchParams)).toEqual({
+        group_id: GROUP_ID,
+        offset: "0",
+        count: "2",
+      });
+      expect(messages.map((m) => m.id)).toEqual(["user_msg", "oa_msg"]);
+      expect(messages.every((m) => m.threadId === GROUP_THREAD)).toBe(true);
+      expect(messages[0]?.author).toMatchObject({
+        userId: "8756287263669629130",
+        fullName: "Phuoc",
+        isMe: false,
+      });
+      expect(messages[0]?.attachments[0]?.type).toBe("image");
+      expect(messages[1]?.author.isMe).toBe(true);
+      expect(nextCursor).toBe("2");
+    });
+
+    it("pages group history five at a time, the size Zalo documents", async () => {
+      const entry = (i: number) => ({
+        src: 1,
+        time: T0 - i,
+        type: "text",
+        message: `m${i}`,
+        message_id: `m${i}`,
+        from_id: "7",
+        group_id: GROUP_ID,
+      });
+      const fetchImpl = vi
+        .fn()
+        .mockResolvedValueOnce(ok([0, 1, 2, 3, 4].map(entry)))
+        .mockResolvedValueOnce(ok([5, 6, 7, 8, 9].map(entry)));
+      const { adapter } = build(fetchImpl);
+
+      const { messages, nextCursor } = await adapter.fetchMessages(GROUP_THREAD);
+
+      const counts = fetchImpl.mock.calls.map((call) =>
+        new URL((call as unknown as [string])[0]).searchParams.get("count"),
+      );
+      expect(counts).toEqual(["5", "5"]);
+      expect(messages).toHaveLength(10);
+      expect(nextCursor).toBe("10");
+    });
+
+    it("files a standalone group history entry under its group", () => {
+      const { adapter } = build();
+      const message = adapter.parseMessage({
+        src: 1,
+        time: T0,
+        type: "text",
+        message: "x",
+        message_id: "h",
+        from_id: "7",
+        to_id: "",
+        group_id: GROUP_ID,
+      });
+      expect(message.threadId).toBe(GROUP_THREAD);
+      expect(message.author.userId).toBe("7");
+    });
+
+    it("parses a group send result under the group", () => {
+      const { adapter } = build();
+      expect(adapter.parseMessage({ message_id: "s", group_id: GROUP_ID }).threadId).toBe(
+        GROUP_THREAD,
+      );
+    });
+
+    it("describes a group thread as not a DM", async () => {
+      const { adapter } = build();
+      await expect(adapter.fetchThread(GROUP_THREAD)).resolves.toMatchObject({ isDM: false });
+    });
+
+    it("refuses another OA's group", async () => {
+      const { adapter, fetchImpl } = build();
+      await expect(adapter.postMessage(`zalo-oa:111:group:${GROUP_ID}`, "hi")).rejects.toThrow(
+        /different Official Account/,
+      );
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("templates", () => {
+    it("sends a template by user ID", async () => {
+      const fetchImpl = vi.fn(async () => ok({ message_id: "tm1", user_id: USER_ID }));
+      const { adapter } = build(fetchImpl);
+      const result = await adapter.sendTemplate(THREAD_ID, "433555", {
+        customer: "Nguyễn Thị Hoàng Anh",
+        total: 100000,
+      });
+
+      expect(result).toMatchObject({ id: "tm1", threadId: THREAD_ID });
+      const { url, body } = lastCall(fetchImpl);
+      expect(url.href).toBe("https://openapi.zalo.me/v3.0/oa/message/template");
+      expect(body).toEqual({
+        user_id: USER_ID,
+        template_id: "433555",
+        template_data: { customer: "Nguyễn Thị Hoàng Anh", total: 100000 },
+      });
+    });
+
+    it.each([
+      ["an empty template ID", "  ", {}],
+      ["an array as data", "1", [] as never],
+      ["null data", "1", null as never],
+    ])("refuses %s before sending", async (_label, id, data) => {
+      const { adapter, fetchImpl } = build();
+      await expect(adapter.sendTemplate(THREAD_ID, id, data)).rejects.toBeInstanceOf(
+        ValidationError,
+      );
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("treats a template send without a message_id as unconfirmed", async () => {
+      const { adapter } = build(vi.fn(async () => ok({ user_id: USER_ID })));
+      await expect(adapter.sendTemplate(THREAD_ID, "1", {})).rejects.toBeInstanceOf(NetworkError);
+    });
+
+    it("lists templates from the business host", async () => {
+      const templates = [{ templateId: 900025, templateName: "T1", status: "ENABLE" }];
+      const fetchImpl = vi.fn(async () => ok(templates));
+      const { adapter } = build(fetchImpl);
+
+      await expect(
+        adapter.listTemplates({ offset: 5, limit: 20, status: "PENDING_REVIEW" }),
+      ).resolves.toEqual(templates);
+      const { url, init } = lastCall(fetchImpl);
+      expect(url.origin).toBe("https://business.openapi.zalo.me");
+      expect(url.pathname).toBe("/template/all");
+      expect(Object.fromEntries(url.searchParams)).toEqual({
+        offset: "5",
+        limit: "20",
+        status: "2",
+      });
+      expect((init.headers as Record<string, string>).access_token).toBe("acc_1");
+    });
+
+    it("lists the first hundred of every status by default", async () => {
+      const fetchImpl = vi.fn(async () => ok([]));
+      const { adapter } = build(fetchImpl);
+      await adapter.listTemplates();
+      expect(Object.fromEntries(lastCall(fetchImpl).url.searchParams)).toEqual({
+        offset: "0",
+        limit: "100",
+      });
+    });
+
+    it.each([
+      [{ limit: 0 }],
+      [{ limit: 101 }],
+      [{ limit: Number.NaN }],
+      [{ offset: -1 }],
+      [{ status: "toString" as never }],
+      [{ status: "ACTIVE" as never }],
+    ])("refuses the listing options %o", async (options) => {
+      const { adapter, fetchImpl } = build();
+      await expect(adapter.listTemplates(options)).rejects.toBeInstanceOf(ValidationError);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    });
+
+    it("honours a custom business host", async () => {
+      const fetchImpl = vi.fn(async () => ok([]));
+      const adapter = new ZaloOaAdapter({
+        appId: APP_ID,
+        appSecret: "s",
+        oaSecretKey: OA_SECRET,
+        oaId: OA_ID,
+        accessToken: "a",
+        refreshToken: "r",
+        accessTokenExpiresAt: Date.now() + 3_600_000,
+        businessApiBaseUrl: "https://proxy.example/",
+        fetchImpl: fetchImpl as never,
+      });
+      await adapter.listTemplates();
+      expect(lastCall(fetchImpl).url.href).toBe(
+        "https://proxy.example/template/all?offset=0&limit=100",
+      );
     });
   });
 

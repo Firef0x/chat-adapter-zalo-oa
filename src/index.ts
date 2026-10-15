@@ -1,4 +1,4 @@
-export { ZaloOaAdapter } from "./adapter.js";
+export { ZALO_BUSINESS_API_HOST, ZaloOaAdapter } from "./adapter.js";
 export { createZaloOaAdapter, zaloOa } from "./factory.js";
 export {
   type AccessTokenProvider,
@@ -56,6 +56,9 @@ export type {
   ZaloOaOutboundMessage,
   ZaloOaRawMessage,
   ZaloOaSendMessageData,
+  ZaloOaTemplateData,
+  ZaloOaTemplateStatus,
+  ZaloOaTemplateSummary,
   ZaloOaThreadId,
   ZaloOaThreadType,
   ZaloOaTokenResponse,

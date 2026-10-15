@@ -86,6 +86,11 @@ export interface ZaloOaAdapterConfig {
    * 50 MiB. Zalo users can send files of up to a gigabyte.
    */
   maxDownloadBytes?: number;
+  /**
+   * Host of the ZBS template management API. Defaults to
+   * `https://business.openapi.zalo.me`.
+   */
+  businessApiBaseUrl?: string;
   /** Defaults to `https://openapi.zalo.me`. */
   apiBaseUrl?: string;
   /** Defaults to `https://oauth.zaloapp.com`. */
@@ -143,8 +148,11 @@ export const ZALO_OA_ERROR = {
   INVALID_APPSECRET_PROOF: -242,
   USER_RESTRICTED: -244,
   POLICY_VIOLATION: -248,
+  GROUP_DISABLED: -237,
+  TEMPLATE_NOT_SENDABLE_BY_UID: -249,
   CLOUD_ACCOUNT_REQUIRED: -320,
   CLOUD_ACCOUNT_UNPAID: -321,
+  OA_NOT_IN_GROUP: -403,
 } as const;
 
 export type ZaloOaErrorCode = (typeof ZALO_OA_ERROR)[keyof typeof ZALO_OA_ERROR];
@@ -167,10 +175,14 @@ export interface ZaloOaTokenResponse {
   error_description?: string;
 }
 
-/** `data` of `POST /v3.0/oa/message/cs`. */
+/**
+ * `data` of a send: `POST /v3.0/oa/message/cs` and `/message/template` name
+ * the user, `POST /v3.0/oa/group/message` names the group.
+ */
 export interface ZaloOaSendMessageData {
   message_id: string;
-  user_id: string;
+  user_id?: string;
+  group_id?: string;
   /** Epoch milliseconds, as a string. */
   sent_time?: string;
   quota?: {
@@ -250,6 +262,23 @@ export interface ZaloOaHistoryMessage {
   to_display_name?: string;
   to_avatar?: string;
   location?: string;
+  /** Set on entries of a group conversation. */
+  group_id?: string;
+}
+
+/** Values for a ZBS template's parameters, as registered with Zalo. */
+export type ZaloOaTemplateData = Record<string, string | number>;
+
+export type ZaloOaTemplateStatus = "ENABLE" | "PENDING_REVIEW" | "REJECT" | "DISABLE";
+
+/** One entry of `GET business.openapi.zalo.me/template/all`. */
+export interface ZaloOaTemplateSummary {
+  templateId: string | number;
+  templateName: string;
+  createdTime?: number;
+  status: ZaloOaTemplateStatus | string;
+  /** `HIGH`, `MEDIUM`, `LOW` or `UNDEFINED`. A `LOW` template may be locked. */
+  templateQuality?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +320,8 @@ export interface ZaloOaWebhookAttachment {
 
 export interface ZaloOaWebhookMessage {
   msg_id?: string;
+  /** Group events' field table names it this; their example uses `msg_id`. */
+  message_id?: string;
   text?: string;
   /** Set on `user_reacted_message`: the icon code, or `/-remove` for a withdrawal. */
   react_icon?: string;
@@ -314,6 +345,8 @@ export interface ZaloOaWebhookEvent {
   /** Epoch milliseconds, as a string. Also part of the signature. */
   timestamp: string;
   user_id_by_app?: string;
+  /** Set on group events, whose recipient is the group rather than the OA. */
+  oa_id?: string;
 }
 
 /** What `parseMessage` accepts: a live delivery or a history entry. */

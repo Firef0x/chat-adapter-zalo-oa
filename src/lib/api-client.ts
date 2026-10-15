@@ -39,6 +39,11 @@ export interface ZaloOaApiClientOptions {
 
 export interface ZaloOaRequest {
   method: "GET" | "POST";
+  /**
+   * Host for this request, when it is not the Open API host. The template
+   * management endpoints live on `business.openapi.zalo.me`.
+   */
+  baseUrl?: string;
   /** Path including the version segment, e.g. `"v3.0/oa/message/cs"`. */
   path: string;
   /**
@@ -73,6 +78,8 @@ const PERMISSION_CODES: ReadonlySet<number> = new Set([
   ZALO_OA_ERROR.INVALID_APPSECRET_PROOF,
   ZALO_OA_ERROR.CLOUD_ACCOUNT_REQUIRED,
   ZALO_OA_ERROR.CLOUD_ACCOUNT_UNPAID,
+  // The group's GMF package expired; someone has to renew it.
+  ZALO_OA_ERROR.GROUP_DISABLED,
 ]);
 
 /** This request, or this recipient, will be refused the same way every time. */
@@ -90,6 +97,9 @@ const VALIDATION_CODES: ReadonlySet<number> = new Set([
   ZALO_OA_ERROR.QUIET_HOURS,
   ZALO_OA_ERROR.USER_RESTRICTED,
   ZALO_OA_ERROR.POLICY_VIOLATION,
+  // Older templates, OTP templates and a few others go by phone number only.
+  ZALO_OA_ERROR.TEMPLATE_NOT_SENDABLE_BY_UID,
+  ZALO_OA_ERROR.OA_NOT_IN_GROUP,
 ]);
 
 /**
@@ -159,8 +169,9 @@ export class ZaloOaApiClient {
       options.sleepImpl ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
-  buildUrl(path: string, query?: ZaloOaRequest["query"]): string {
-    const url = new URL(`${this.baseUrl}/${path.replace(/^\/+/, "")}`);
+  buildUrl(path: string, query?: ZaloOaRequest["query"], baseUrl?: string): string {
+    const host = baseUrl ? baseUrl.replace(/\/+$/, "") : this.baseUrl;
+    const url = new URL(`${host}/${path.replace(/^\/+/, "")}`);
     for (const [key, value] of Object.entries(query ?? {})) {
       if (value !== undefined) {
         url.searchParams.set(key, String(value));
@@ -227,7 +238,7 @@ export class ZaloOaApiClient {
 
     let response: Response;
     try {
-      response = await this.fetchImpl(this.buildUrl(req.path, req.query), {
+      response = await this.fetchImpl(this.buildUrl(req.path, req.query, req.baseUrl), {
         method: req.method,
         headers,
         body,

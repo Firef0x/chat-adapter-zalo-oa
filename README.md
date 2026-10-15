@@ -2,7 +2,7 @@
 
 [Chat SDK](https://chat-sdk.dev) adapter for the [Zalo Official Account (OA) API](https://docs.zaloplatforms.com/docs/OA).
 
-This release covers **one-to-one conversations** between an Official Account and a user: text, images, GIFs, files, stickers and reactions in both directions, quoted replies, and history. Group chats (GMF) and template messages are planned.
+It covers **one-to-one conversations** and **GMF group chats**: text, images, GIFs, files and stickers in both directions, reactions and quoted replies one to one, history, and **ZBS template messages**.
 
 > This targets the Official Account API at `openapi.zalo.me`. It is a different product from the Zalo Bot Platform, which [`chat-adapter-zalo`](https://www.npmjs.com/package/chat-adapter-zalo) covers.
 
@@ -44,9 +44,9 @@ export async function POST(request: Request) {
 ## Setup
 
 1. **Create an app** on [developers.zalo.me](https://developers.zalo.me) and note its **App ID** and **secret key**.
-2. **Link the app to your OA** and grant it at least *send messages and notifications via OA* and *manage user messages*. Grant *manage OA information* for `fetchChannelInfo()` and *manage user information* for `getUser()`.
+2. **Link the app to your OA** and grant it at least *send messages and notifications via OA* and *manage user messages*. Grant *manage OA information* for `fetchChannelInfo()`, *manage user information* for `getUser()`, *manage group information* for group chats, and *manage message templates* for `listTemplates()`.
 3. **Get tokens.** For a single OA, the API Explorer under *Tools* issues an OA access token and refresh token directly. For third-party apps, use the OAuth v4 PKCE flow described in Zalo's [authorization guide](https://docs.zaloplatforms.com/docs/OA/bat-dau/xac-thuc-va-uy-quyen-cho-ung-dung-new).
-4. **Configure the webhook** in the app's settings: set the URL, copy the **OA secret key** shown there, and enable the `user_send_*` events.
+4. **Configure the webhook** in the app's settings: set the URL, copy the **OA secret key** shown there, and enable the `user_send_*` events, `user_reacted_message`, and the `user_send_group_*` events if you use groups.
 
 Zalo requires a paid OA service package (Growth or Complete) to link an app through the API.
 
@@ -66,7 +66,7 @@ Zalo requires a paid OA service package (Growth or Complete) to link an app thro
 | `signatureToleranceSeconds` | | Maximum webhook age. Default `7200`. |
 | `userName` | | Bot display name. Default `"zalo-oa-bot"`. |
 | `maxDownloadBytes` | | Largest attachment `fetchData()` will buffer. Default 50 MiB. Zalo users can send files of up to 1 GB. |
-| `apiBaseUrl`, `oauthBaseUrl` | | Override the API hosts, for a proxy. |
+| `apiBaseUrl`, `oauthBaseUrl`, `businessApiBaseUrl` | | Override the API hosts, for a proxy. |
 | `maxRateLimitRetries`, `rateLimitRetryDelayMs` | | Throttling backoff. Defaults `2` and `1000`. |
 
 ### Tokens
@@ -90,15 +90,46 @@ Zalo also expects an answer **within two seconds**, so the adapter does not wait
 
 The default tolerance of two hours is deliberate. Zalo retries a failed delivery after 30 s, 5 min, 15 min, 30 min and 1 h, each time with the original timestamp. A shorter window would discard exactly the retries meant to recover an outage. Redeliveries are deduplicated by message ID.
 
-The adapter dispatches `user_send_*` events as messages and `user_reacted_message` as reactions. It ignores the OA's own `oa_send_*` and `oa_reacted_message` echoes, so the bot never answers itself or a colleague using the OA chat tool. Group events and other event types are ignored in this release.
+The adapter dispatches `user_send_*` and `user_send_group_*` events as messages and `user_reacted_message` as reactions. It ignores the OA's own `oa_send_*`, `oa_send_group_*` and `oa_reacted_message` echoes, so the bot never answers itself or a colleague using the OA chat tool. Other event types are ignored.
+
+Each event is checked against the configured OA before it is handled. A one-to-one event names the OA as its recipient. A group event's recipient is the group, so the check reads its `oa_id` instead, and a group event without one is refused.
 
 ## Messaging rules
 
 Zalo enforces these, not the adapter:
 
-- An OA can send consultation messages only to a user who **interacted within the last 7 days**. Otherwise the send fails with a `ValidationError`. Sending to a user who has never interacted is not possible.
+- An OA can send consultation messages only to a user who **interacted within the last 7 days**. Otherwise the send fails with a `ValidationError`, and a paid [template message](#template-messages) is the way to reach them.
 - Consultation messages are free within **48 hours** of the user's last interaction and charged after that.
 - Text is limited to **2,000 characters**. Longer messages are refused before a request is made.
+
+## Group chats
+
+Zalo's group chats (GMF) are groups the OA owns, created through the OA and paid for by its service package. A group thread ID has the form `zalo-oa:<oaId>:group:<groupId>`, and `isDM()` is `false` for it.
+
+- **Receiving:** members' messages arrive like one-to-one messages, attachments included. A message whose text contains `[@<oaId>]` mentions the OA and is delivered with `isMention: true`, so `onNewMention` fires for it. `[@<groupId>]`, which addresses every member, does not count as a mention of the bot.
+- **Sending:** text, images, GIFs, files and stickers work as they do one to one. Mention a member by writing `[@<userId>]` in the text, or everyone with `[@<groupId>]`. Zalo has no messaging window for groups.
+- **Not offered by Zalo in groups:** quoted replies, reactions and template messages. These throw `NotImplementedError` for a group thread.
+- **History:** read five at a time, the page size Zalo documents for groups.
+
+Creating groups and managing members are not covered by this adapter.
+
+## Template messages
+
+ZBS templates are how an OA reaches a user outside the seven-day consultation window. You register a template with Zalo, which reviews it and fixes its layout. A send only names the template and fills in its parameters:
+
+```ts
+await zaloOa.sendTemplate(threadId, "433555", {
+  customer: "Nguyễn Thị Hoàng Anh",
+  total: 100000,
+});
+
+const templates = await zaloOa.listTemplates({ status: "ENABLE" });
+```
+
+- Templates are sent by user ID, so only to one-to-one threads.
+- Every successful send is **charged**. There is no free allowance.
+- Templates created before 10 December 2025, OTP templates and a few other kinds can be sent by phone number only. Sending one by user ID fails with a `ValidationError` for error `-249`.
+- `listTemplates()` returns at most 100 per call, newest first, and can filter by `ENABLE`, `PENDING_REVIEW`, `REJECT` or `DISABLE`.
 
 ## Sending media
 
@@ -165,7 +196,9 @@ Zalo's withdrawal names no emoji. `removeReaction` therefore removes whatever re
 | Send text | Yes |
 | Send image, GIF, file | Yes, one per message |
 | Send and receive stickers | `sendSticker()`, `getStickerId()` |
-| Send and receive reactions | Yes, Zalo's fixed set |
+| Send and receive reactions | Yes, Zalo's fixed set, one to one |
+| Group chats | Send and receive, history, mentions |
+| Template messages | `sendTemplate()`, `listTemplates()` |
 | Reply with a quote | Yes, via `reply()` |
 | Cards | Flattened to text, buttons listed as options |
 | Message history | Yes. Backward only, 10 per request, offset cursor. |
@@ -173,7 +206,7 @@ Zalo's withdrawal names no emoji. `removeReaction` therefore removes whatever re
 | OA profile, user profile | `fetchChannelInfo()`, `getUser()` |
 | Typing indicator | No-op. Zalo has no such API. |
 | Edit, delete | Not supported by Zalo |
-| Group chats, template messages | Not yet |
+| Creating groups, managing members, templates by phone number | Not covered |
 
 ## Errors
 
@@ -183,8 +216,8 @@ Zalo reports failures as HTTP 200 with a non-zero `error`. The adapter maps them
 | --- | --- |
 | `AdapterRateLimitError` | `-32`, retried with backoff first |
 | `AuthenticationError` | `-216`, `-220`, after one automatic refresh |
-| `PermissionError` | App or OA misconfigured: `-204`, `-205`, `-209`, `-212`, `-219`, `-221`, `-223`, `-224`, `-235`, `-242`, `-320`, `-321` |
-| `ValidationError` | Request or recipient refused: `-100`, `-201`, `-210`, `-211`, `-213`, `-218`, `-227`, `-230`, `-232`, `-233`, `-234`, `-244`, `-248` |
+| `PermissionError` | App, OA or group misconfigured: `-204`, `-205`, `-209`, `-212`, `-219`, `-221`, `-223`, `-224`, `-235`, `-237`, `-242`, `-320`, `-321` |
+| `ValidationError` | Request or recipient refused: `-100`, `-201`, `-210`, `-211`, `-213`, `-218`, `-227`, `-230`, `-232`, `-233`, `-234`, `-244`, `-248`, `-249`, `-403` |
 | `NetworkError` | Transport failures, `-200`, and unknown codes. These are worth retrying. |
 
 ## Development

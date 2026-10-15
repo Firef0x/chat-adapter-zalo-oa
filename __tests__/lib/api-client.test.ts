@@ -42,6 +42,9 @@ describe("mapZaloOaError", () => {
     [ZALO_OA_ERROR.NO_RECENT_INTERACTION, ValidationError],
     [ZALO_OA_ERROR.INTERACTION_EXPIRED, ValidationError],
     [ZALO_OA_ERROR.QUIET_HOURS, ValidationError],
+    [ZALO_OA_ERROR.TEMPLATE_NOT_SENDABLE_BY_UID, ValidationError],
+    [ZALO_OA_ERROR.OA_NOT_IN_GROUP, ValidationError],
+    [ZALO_OA_ERROR.GROUP_DISABLED, PermissionError],
     // The generic send failure and anything unknown stay retryable.
     [ZALO_OA_ERROR.SEND_FAILED, NetworkError],
     [-9999, NetworkError],
@@ -91,6 +94,19 @@ describe("ZaloOaApiClient", () => {
     expect(parsed.searchParams.has("skip")).toBe(false);
     expect(init.body).toBeUndefined();
     expect(init.headers).toEqual({ access_token: "tok_1" });
+  });
+
+  it("sends a request to its own host when it names one", async () => {
+    const fetchImpl = vi.fn(async () => envelope(0, []));
+    await client(fetchImpl).request({
+      method: "GET",
+      baseUrl: "https://business.openapi.zalo.me/",
+      path: "template/all",
+      query: { offset: 0 },
+    });
+    expect(fetchImpl.mock.calls[0]?.[0]).toBe(
+      "https://business.openapi.zalo.me/template/all?offset=0",
+    );
   });
 
   it("strips a trailing slash from a custom base URL", () => {
