@@ -46,6 +46,7 @@ export interface VerifyOptions {
   oaSecretKey: string;
   /** Epoch milliseconds. */
   now?: number;
+  /** Defaults to {@link DEFAULT_SIGNATURE_TOLERANCE_SECONDS}, also when not a non-negative number. */
   toleranceSeconds?: number;
 }
 
@@ -96,15 +97,14 @@ function parseSignatureHeader(header: string): string | null {
  * throwing, so the caller can log the cause.
  */
 export function verifyWebhookSignature(options: VerifyOptions): VerificationResult {
-  const {
-    header,
-    rawBody,
-    appId,
-    timestamp,
-    oaSecretKey,
-    now = Date.now(),
-    toleranceSeconds = DEFAULT_SIGNATURE_TOLERANCE_SECONDS,
-  } = options;
+  const { header, rawBody, appId, timestamp, oaSecretKey, now = Date.now() } = options;
+  // A destructuring default covers only `undefined`. `NaN` would make the
+  // age comparison below never true and so accept a capture replayed years
+  // later; a negative value would reject every delivery.
+  const toleranceSeconds =
+    Number.isFinite(options.toleranceSeconds) && (options.toleranceSeconds as number) >= 0
+      ? (options.toleranceSeconds as number)
+      : DEFAULT_SIGNATURE_TOLERANCE_SECONDS;
 
   if (!header) {
     return { valid: false, reason: "missing signature header", stale: false };

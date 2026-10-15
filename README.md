@@ -2,7 +2,7 @@
 
 [Chat SDK](https://chat-sdk.dev) adapter for the [Zalo Official Account (OA) API](https://docs.zaloplatforms.com/docs/OA).
 
-It covers **one-to-one conversations** and **GMF group chats**: text, images, GIFs, files and stickers in both directions, reactions and quoted replies one to one, history, and **ZBS template messages**.
+It covers **one-to-one conversations**, **anonymous chat-widget users** and **GMF group chats**: text, images, GIFs, files and stickers in both directions, reactions, quoted replies and read receipts one to one, history, **group management**, and **ZBS template messages** by user ID or phone number.
 
 > This targets the Official Account API at `openapi.zalo.me`. It is a different product from the Zalo Bot Platform, which [`chat-adapter-zalo`](https://www.npmjs.com/package/chat-adapter-zalo) covers.
 
@@ -46,7 +46,7 @@ export async function POST(request: Request) {
 1. **Create an app** on [developers.zalo.me](https://developers.zalo.me) and note its **App ID** and **secret key**.
 2. **Link the app to your OA** and grant it at least *send messages and notifications via OA* and *manage user messages*. Grant *manage OA information* for `fetchChannelInfo()`, *manage user information* for `getUser()`, *manage group information* for group chats, and *manage message templates* for `listTemplates()`.
 3. **Get tokens.** For a single OA, the API Explorer under *Tools* issues an OA access token and refresh token directly. For third-party apps, use the OAuth v4 PKCE flow described in Zalo's [authorization guide](https://docs.zaloplatforms.com/docs/OA/bat-dau/xac-thuc-va-uy-quyen-cho-ung-dung-new).
-4. **Configure the webhook** in the app's settings: set the URL, copy the **OA secret key** shown there, and enable the `user_send_*` events, `user_reacted_message`, and the `user_send_group_*` events if you use groups.
+4. **Configure the webhook** in the app's settings: set the URL, copy the **OA secret key** shown there, and enable the `user_send_*` events, `user_reacted_message`, `user_seen_message` for read receipts, `anonymous_send_*` for chat-widget users, and the `user_send_group_*` events if you use groups.
 
 Zalo requires a paid OA service package (Growth or Complete) to link an app through the API.
 
@@ -65,6 +65,7 @@ If the app has **app secret proof** checking enabled in its settings, set `appSe
 | `accessTokenExpiresAt` | | Epoch ms. If omitted, the adapter refreshes once on first use. |
 | `refreshTokenExpiresAt` | | Epoch ms. |
 | `onTokenRefresh` | | Called with the new tokens after every refresh. **Persist them.** |
+| `onReadReceipt` | | Called when a user reads messages the OA sent. See [Read receipts](#read-receipts). |
 | `signatureToleranceSeconds` | | Maximum webhook age. Default `7200`. |
 | `appSecretProof` | | Send an `appsecret_proof` header on every API call. Turn on if the app has that check enabled on developers.zalo.me, where calls without it fail with error `-242`. Default off. |
 | `userName` | | Bot display name. Default `"zalo-oa-bot"`. |
@@ -93,7 +94,7 @@ Zalo also expects an answer **within two seconds**, so the adapter does not wait
 
 The default tolerance of two hours is deliberate. Zalo retries a failed delivery after 30 s, 5 min, 15 min, 30 min and 1 h, each time with the original timestamp. A shorter window would discard exactly the retries meant to recover an outage. Redeliveries are deduplicated by message ID.
 
-The adapter dispatches `user_send_*` and `user_send_group_*` events as messages and `user_reacted_message` as reactions. It ignores the OA's own `oa_send_*`, `oa_send_group_*` and `oa_reacted_message` echoes, so the bot never answers itself or a colleague using the OA chat tool. Other event types are ignored.
+The adapter dispatches `user_send_*`, `anonymous_send_*` and `user_send_group_*` events as messages, `user_reacted_message` as reactions, and `user_seen_message` to `onReadReceipt`. It ignores the OA's own `oa_send_*`, `oa_send_anonymous_*`, `oa_send_group_*` and `oa_reacted_message` echoes, so the bot never answers itself or a colleague using the OA chat tool. Other event types are ignored.
 
 Each event is checked against the configured OA before it is handled. A one-to-one event names the OA as its recipient. A group event's recipient is the group, so the check reads its `oa_id` instead, and a group event without one is refused.
 
@@ -105,6 +106,36 @@ Zalo enforces these, not the adapter:
 - Consultation messages are free within **48 hours** of the user's last interaction and charged after that.
 - Text is limited to **2,000 characters**. Longer messages are refused before a request is made.
 
+## Read receipts
+
+Zalo reports when a user reads messages the OA sent, through `user_seen_message`. Chat SDK has no inbound read-receipt event, so it goes to a callback:
+
+```ts
+createZaloOaAdapter({
+  onReadReceipt: async ({ threadId, messageIds, readAt }) => {
+    await markRead(threadId, messageIds, readAt);
+  },
+});
+```
+
+Zalo emits it only when the user reads on Zalo Mobile, and only to the app that sent the message. A receipt is a high-water mark, so apply it as `max(existing, readAt)`: a redelivery can land after a newer one. A handler that throws is logged; Zalo does not redeliver on request. Pass `waitUntil` to the webhook on serverless runtimes so the handler outlives the response.
+
+## Anonymous users
+
+A person who writes through the OA's chat widget without signing in is **anonymous**: Zalo identifies them by an anonymous ID that is valid only within one conversation. The thread ID carries both, `zalo-oa:<oaId>:anonymous:<anonymousId>:<conversationId>`, so a reply needs nothing else. `isDM()` is `true` for it.
+
+- **Receiving:** text, images, stickers and files arrive like one-to-one messages.
+- **Sending:** text, files and stickers work as usual. Zalo takes an image for an anonymous user **only by URL**, never from uploaded bytes, so use `sendImageUrl()`; a `files` attachment that is an image is refused before anything is uploaded.
+- **Not offered by Zalo:** history, quoted replies, reactions and templates. These throw `NotImplementedError`.
+
+## Images by URL
+
+```ts
+await zaloOa.sendImageUrl(threadId, "https://cdn.example/arrivals.jpg", "New arrivals");
+```
+
+Works for every kind of thread, and is the only way to send an image to an anonymous user. Zalo fetches the URL itself and wants a public JPG or PNG of at most 1 MB.
+
 ## Group chats
 
 Zalo's group chats (GMF) are groups the OA owns, created through the OA and paid for by its service package. A group thread ID has the form `zalo-oa:<oaId>:group:<groupId>`, and `isDM()` is `false` for it.
@@ -114,7 +145,34 @@ Zalo's group chats (GMF) are groups the OA owns, created through the OA and paid
 - **Not offered by Zalo in groups:** quoted replies, reactions and template messages. These throw `NotImplementedError` for a group thread.
 - **History:** read five at a time, the page size Zalo documents for groups.
 
-Creating groups and managing members are not covered by this adapter.
+### Managing groups
+
+`adapter.groups` wraps Zalo's group management API. A group runs on a GMF package the OA holds, called an asset; creating a group needs an available one, and a group whose package expires is dissolved after 45 days unless renewed.
+
+```ts
+const assets = await zaloOa.groups.listAssets();
+const asset = assets.find((a) => a.status === "available");
+
+const { threadId } = await zaloOa.groups.create({
+  name: "Support",
+  assetId: asset.asset_id,
+  memberUserIds: [adminUserId, customerUserId], // 1–99, at least one OA admin
+});
+
+await zaloOa.groups.invite(threadId, [anotherUserId]);
+const { items: members, total } = await zaloOa.groups.listMembers(threadId);
+await zaloOa.groups.update(threadId, { name: "Support team", join_appr: true });
+```
+
+| Method | Zalo endpoint |
+| --- | --- |
+| `listAssets()` | Packages the OA holds, used or available |
+| `create()`, `list()`, `get()`, `update()`, `renew()`, `delete()` | The group itself |
+| `listMembers()`, `listPendingMembers()` | Members, five per page by default |
+| `invite()`, `remove()`, `accept()`, `reject()` | Membership |
+| `addAdmins()`, `removeAdmins()` | Deputy admins |
+
+Every method takes and returns thread IDs. Invited users must follow the OA or have interacted with it in the last 7 days.
 
 ## Template messages
 
@@ -129,10 +187,19 @@ await zaloOa.sendTemplate(threadId, "433555", {
 const templates = await zaloOa.listTemplates({ status: "ENABLE" });
 ```
 
-- Templates are sent by user ID, so only to one-to-one threads.
+- `sendTemplate()` sends by user ID, so only to one-to-one threads.
 - Every successful send is **charged**. There is no free allowance.
-- Templates created before 10 December 2025, OTP templates and a few other kinds can be sent by phone number only. Sending one by user ID fails with a `ValidationError` for error `-249`.
-- `listTemplates()` returns at most 100 per call, newest first, and can filter by `ENABLE`, `PENDING_REVIEW`, `REJECT` or `DISABLE`.
+- `listTemplates()` returns `{ templates, total }`, at most 100 per call, newest first, and can filter by `ENABLE`, `PENDING_REVIEW`, `REJECT` or `DISABLE`.
+
+### By phone number
+
+```ts
+const receipt = await zaloOa.sendTemplateByPhone("84987654321", "433555", data, {
+  trackingId: "order-42", // yours, for reconciliation; generated when omitted
+});
+```
+
+This reaches a number that has never interacted with the OA, and is the **only** way to send OTP templates and templates created before 10 December 2025, which fail by user ID with error `-249`. The number must be linked to a Zalo account and written with its country code. It needs the *send messages by phone number* permission, is charged at the phone rate, and draws on a daily quota Zalo adjusts to the OA's sending quality; the receipt reports what remains. A phone send belongs to no thread, so it returns Zalo's receipt rather than a message.
 
 ## Sending media
 
@@ -199,9 +266,13 @@ Zalo's withdrawal names no emoji. `removeReaction` therefore removes whatever re
 | Send text | Yes |
 | Send image, GIF, file | Yes, one per message |
 | Send and receive stickers | `sendSticker()`, `getStickerId()` |
+| Send an image by URL | `sendImageUrl()` |
+| Read receipts | `onReadReceipt` |
+| Anonymous chat-widget users | Send and receive; no history, quotes or reactions |
 | Send and receive reactions | Yes, Zalo's fixed set, one to one |
 | Group chats | Send and receive, history, mentions |
-| Template messages | `sendTemplate()`, `listTemplates()` |
+| Template messages | `sendTemplate()`, `sendTemplateByPhone()`, `listTemplates()` |
+| Group management | `adapter.groups` |
 | Reply with a quote | Yes, via `reply()` |
 | Cards | Flattened to text, buttons listed as options |
 | Message history | Yes. Backward only, 10 per request, offset cursor. |
@@ -209,7 +280,6 @@ Zalo's withdrawal names no emoji. `removeReaction` therefore removes whatever re
 | OA profile, user profile | `fetchChannelInfo()`, `getUser()` |
 | Typing indicator | No-op. Zalo has no such API. |
 | Edit, delete | Not supported by Zalo |
-| Creating groups, managing members, templates by phone number | Not covered |
 
 ## Errors
 

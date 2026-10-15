@@ -45,6 +45,37 @@ describe("thread IDs", () => {
     expect(() => decodeThreadId(threadId)).toThrow(ValidationError);
   });
 
+  it("round-trips an anonymous conversation, which needs two IDs", () => {
+    const data = {
+      oaId: "4587655845403518947",
+      type: "anonymous" as const,
+      id: "1ffedc467f179649cf06",
+      conversationId: "fa8f3f8701c2e89cb1d3",
+    };
+    const threadId = encodeThreadId(data);
+    expect(threadId).toBe(
+      "zalo-oa:4587655845403518947:anonymous:1ffedc467f179649cf06:fa8f3f8701c2e89cb1d3",
+    );
+    expect(decodeThreadId(threadId)).toEqual(data);
+  });
+
+  it("refuses an anonymous thread without a conversation", () => {
+    expect(() => encodeThreadId({ oaId: "1", type: "anonymous", id: "2" })).toThrow(
+      ValidationError,
+    );
+    expect(() => decodeThreadId("zalo-oa:1:anonymous:2")).toThrow(ValidationError);
+    expect(() => decodeThreadId("zalo-oa:1:anonymous:2:")).toThrow(ValidationError);
+    expect(() => decodeThreadId("zalo-oa:1:anonymous:2:a b")).toThrow(ValidationError);
+  });
+
+  it("does not let a user thread carry a fifth segment", () => {
+    expect(() => decodeThreadId("zalo-oa:1:user:2:3")).toThrow(ValidationError);
+    // A conversation ID on a non-anonymous thread is ignored, not encoded.
+    expect(encodeThreadId({ oaId: "1", type: "user", id: "2", conversationId: "3" })).toBe(
+      "zalo-oa:1:user:2",
+    );
+  });
+
   it("derives the OA's channel from a thread", () => {
     expect(channelIdFromThreadId("zalo-oa:42:user:7")).toBe("zalo-oa:42");
   });

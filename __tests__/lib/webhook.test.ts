@@ -104,6 +104,18 @@ describe("verifyWebhookSignature", () => {
     expect(verify({ now: NOW + 61_000, toleranceSeconds: 60 })).toMatchObject({ stale: true });
   });
 
+  it.each([Number.NaN, -1, Number.POSITIVE_INFINITY])(
+    "falls back to the default tolerance when given %s",
+    (toleranceSeconds) => {
+      // NaN would otherwise accept a capture replayed years later, and a
+      // negative value would reject every delivery.
+      expect(verify({ now: NOW + 1000, toleranceSeconds })).toEqual({ valid: true });
+      expect(
+        verify({ now: NOW + DEFAULT_SIGNATURE_TOLERANCE_SECONDS * 1000 + 1000, toleranceSeconds }),
+      ).toMatchObject({ valid: false, stale: true });
+    },
+  );
+
   it("rejects a signed but non-numeric timestamp without calling it stale", () => {
     const header = signWebhookBody(BODY, APP_ID, "soon", SECRET);
     expect(verify({ header, timestamp: "soon" })).toEqual({

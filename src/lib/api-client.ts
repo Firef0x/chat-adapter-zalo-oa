@@ -210,6 +210,16 @@ export class ZaloOaApiClient {
    * handler would be worse than failing.
    */
   async request<TData>(req: ZaloOaRequest): Promise<TData> {
+    return (await this.requestEnvelope<TData>(req)).data;
+  }
+
+  /**
+   * Perform a request and return the whole successful envelope.
+   *
+   * For the few endpoints that put something useful beside `data`, such as
+   * the template listing's `metadata.total`.
+   */
+  async requestEnvelope<TData>(req: ZaloOaRequest): Promise<ZaloOaApiEnvelope<TData>> {
     let delay = this.rateLimitRetryDelayMs;
 
     for (let attempt = 0; ; attempt++) {
@@ -221,7 +231,7 @@ export class ZaloOaApiClient {
         if (envelope.error !== ZALO_OA_ERROR.OK) {
           throw mapZaloOaError(envelope.error, envelope.message);
         }
-        return envelope.data;
+        return envelope;
       }
 
       // oxlint-disable-next-line no-await-in-loop

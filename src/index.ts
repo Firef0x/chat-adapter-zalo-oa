@@ -12,6 +12,13 @@ export {
 export { cardToPlainText } from "./lib/card-to-text.js";
 export { ZaloOaFormatConverter } from "./lib/format-converter.js";
 export {
+  type CreateGroupOptions,
+  type GroupPageOptions,
+  type UpdateGroupOptions,
+  type ZaloOaGroupInfoLike,
+  ZaloOaGroups,
+} from "./lib/groups.js";
+export {
   FILE_TYPES,
   getStickerId,
   gifDimensions,
@@ -51,13 +58,24 @@ export {
 export { ZALO_OA_ERROR } from "./types.js";
 export type {
   ZaloOaAdapterConfig,
+  ZaloOaAnonymousMessageEventName,
   ZaloOaApiEnvelope,
+  ZaloOaGroupAsset,
+  ZaloOaGroupDetail,
+  ZaloOaGroupInfo,
+  ZaloOaGroupMember,
+  ZaloOaGroupPage,
+  ZaloOaGroupSettings,
+  ZaloOaGroupSummary,
   ZaloOaErrorCode,
   ZaloOaHistoryMessage,
   ZaloOaInfo,
   ZaloOaMediaElement,
   ZaloOaOutboundMessage,
+  ZaloOaPhoneTemplateData,
+  ZaloOaPhoneTemplateResult,
   ZaloOaRawMessage,
+  ZaloOaReadReceiptEvent,
   ZaloOaSendMessageData,
   ZaloOaTemplateData,
   ZaloOaTemplateStatus,
